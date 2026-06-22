@@ -118,6 +118,15 @@ class TestSingleProcessBaseline:
         assert len(reports) == 1
         assert reports[0]["total_runs"] == 4
 
+    def test_rampart_sinks_fixture_warns_deprecation(
+        self,
+        pytester: Pytester,
+    ) -> None:
+        _setup_simple_tests(pytester)
+        result = pytester.runpytest("-p", "no:cacheprovider")
+        result.assert_outcomes(passed=4)
+        result.stdout.fnmatch_lines(["*rampart_sinks fixture is deprecated*"])
+
 
 class TestXdistConsolidation:
     def test_xdist_emits_single_consolidated_report(

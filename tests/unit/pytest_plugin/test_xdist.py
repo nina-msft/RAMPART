@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import warnings
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
@@ -995,6 +996,45 @@ class TestSinkDiscovery:
         assert result == []
         assert any("requires arguments" in r.getMessage() for r in caplog.records)
         assert any("pytest_rampart_sinks" in r.getMessage() for r in caplog.records)
+
+    def test_fixture_form_emits_deprecation(self) -> None:
+        sink = MagicMock(spec=ReportSink)
+
+        @pytest.fixture
+        def rampart_sinks() -> list[ReportSink]:
+            return [sink]
+
+        plugin = MagicMock(
+            spec=["rampart_sinks", "__name__"],
+            rampart_sinks=rampart_sinks,
+            __name__="mod",
+        )
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [plugin]
+        with pytest.warns(
+            DeprecationWarning,
+            match="rampart_sinks fixture is deprecated",
+        ):
+            result = discover_sinks_from_conftest(config=config)
+        assert sink in result
+
+    def test_list_form_does_not_emit_deprecation(self) -> None:
+        sink = MagicMock(spec=ReportSink)
+        plugin = MagicMock(
+            spec=["rampart_sinks", "__name__"],
+            rampart_sinks=[sink],
+            __name__="mod",
+        )
+        config = MagicMock()
+        config.pluginmanager.get_plugins.return_value = [plugin]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            discover_sinks_from_conftest(config=config)
+        assert not any(
+            issubclass(w.category, DeprecationWarning)
+            and "rampart_sinks fixture" in str(w.message)
+            for w in caught
+        )
 
 
 class TestReportTestRunMetadata:
