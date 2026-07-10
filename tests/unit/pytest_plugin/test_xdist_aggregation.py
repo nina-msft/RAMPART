@@ -438,8 +438,10 @@ class TestXdistMetadata:
     def test_size_cap_marks_run_incomplete(self, pytester: Pytester) -> None:
         """Forcing a 1-byte cap surfaces incompleteness in report metadata.
 
-        Triggers the truncation path so the controller must record
-        ``incomplete=True`` plus a reason in the merged report.
+        Under the durable shard transport the cap applies per record, so a
+        1-byte cap drops every record on each worker; the controller must
+        record ``incomplete=True`` plus a per-worker reason naming the
+        dropped records in the merged report.
         """
         _setup_simple_tests(pytester)
         pytester.runpytest(
@@ -454,7 +456,7 @@ class TestXdistMetadata:
         metadata = reports[0].get("metadata", {})
         assert metadata.get("incomplete") is True
         reasons = metadata.get("incomplete_reasons", [])
-        assert any("truncated" in r for r in reasons)
+        assert any("dropped" in r for r in reasons)
 
 
 class TestCollectOnly:
@@ -509,3 +511,134 @@ class TestCloneIdDeterminism:
         # deterministic clone IDs so that workers can match them.
         if serial_ids and parallel_ids:
             assert serial_ids == parallel_ids
+
+
+class TestShardCrashRecovery:
+    def test_worker_crash_preserves_finished_results(
+        self,
+        pytester: Pytester,
+    ) -> None:
+        """A worker killed mid-run keeps the results it already flushed.
+
+        Under the durable shard transport each finished result is streamed
+        to disk, so an abrupt ``os._exit`` (simulating a SIGKILL) after
+        three of four tests still lets the controller recover those three
+        and mark the run incomplete. The legacy inline transport flushed
+        only at a clean ``pytest_sessionfinish``, so a crash there lost
+        every result the worker had produced -- this is the fix for that
+        durability gap.
+        """
+        pytester.makeconftest(_CONFTEST)
+        pytester.makepyfile(  # pyright: ignore[reportUnknownMemberType]
+            test_crash="""
+            import os
+
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+            from rampart.core.types import ObservabilityLevel
+
+            def _record(summary):
+                record_result(Result(
+                    safe=True, status=SafetyStatus.SAFE, summary=summary,
+                    observability_level=ObservabilityLevel.RESPONSE_ONLY,
+                ))
+
+            @pytest.mark.harm("test")
+            def test_c0():
+                _record("c0")
+
+            @pytest.mark.harm("test")
+            def test_c1():
+                _record("c1")
+
+            @pytest.mark.harm("test")
+            def test_c2():
+                _record("c2")
+
+            @pytest.mark.harm("test")
+            def test_c3_crash():
+                # Record, then die before the fixture can flush this one.
+                _record("c3")
+                os._exit(1)
+            """,
+        )
+        pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+        )
+        reports = _load_reports(pytester)
+        assert len(reports) == 1
+        report = reports[0]
+        # The three results flushed before the crash survive on disk; the
+        # in-flight fourth (killed before its fixture teardown) does not.
+        assert report["total_runs"] == 3
+        metadata = report.get("metadata", {})
+        assert metadata.get("incomplete") is True
+        reasons = metadata.get("incomplete_reasons", [])
+        assert any("recovered" in r for r in reasons)
+
+
+class TestShardGranularSizeCap:
+    def test_oversized_record_dropped_siblings_survive(
+        self,
+        pytester: Pytester,
+    ) -> None:
+        """A single oversized record is dropped without losing its siblings.
+
+        The per-record cap drops only the record that exceeds it; the other
+        results the same worker produced are still recovered. The legacy
+        inline transport dropped the worker's *entire* payload when the
+        aggregate exceeded the cap -- this is the fix for that granularity
+        gap. A cap of 4 KiB keeps the small results but drops the one whose
+        summary is padded past the limit.
+        """
+        pytester.makeconftest(_CONFTEST)
+        pytester.makepyfile(  # pyright: ignore[reportUnknownMemberType]
+            test_sizecap="""
+            import pytest
+            from rampart import record_result
+            from rampart.core.result import Result, SafetyStatus
+            from rampart.core.types import ObservabilityLevel
+
+            def _record(summary):
+                record_result(Result(
+                    safe=True, status=SafetyStatus.SAFE, summary=summary,
+                    observability_level=ObservabilityLevel.RESPONSE_ONLY,
+                ))
+
+            @pytest.mark.harm("test")
+            def test_s0():
+                _record("s0")
+
+            @pytest.mark.harm("test")
+            def test_s1():
+                _record("s1")
+
+            @pytest.mark.harm("test")
+            def test_s2_oversized():
+                _record("x" * 8192)
+
+            @pytest.mark.harm("test")
+            def test_s3():
+                _record("s3")
+            """,
+        )
+        pytester.runpytest(
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "1",
+            "--rampart-xdist-max-bytes=4096",
+        )
+        reports = _load_reports(pytester)
+        assert len(reports) == 1
+        report = reports[0]
+        # Three small results survive; only the oversized one is dropped.
+        assert report["total_runs"] == 3
+        metadata = report.get("metadata", {})
+        assert metadata.get("incomplete") is True
+        reasons = metadata.get("incomplete_reasons", [])
+        assert any("dropped" in r for r in reasons)

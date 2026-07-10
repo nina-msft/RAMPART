@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -44,15 +45,24 @@ from rampart.pytest_plugin._collection import (
 from rampart.pytest_plugin._session import RampartSession
 from rampart.pytest_plugin._xdist import (
     DEFAULT_SIZE_LIMIT_BYTES,
+    SHARD_DIR_KEY,
     SIZE_LIMIT_OPTION,
+    ShardWriter,
     SizeLimitError,
+    build_shard_writer,
+    create_shard_dir,
     discover_sinks_from_conftest,
     finalize_worker,
+    finalize_worker_shards,
     get_dist_mode,
     get_worker_count,
     handle_testnodedown,
     is_xdist_controller,
     is_xdist_worker,
+    remove_shard_dir,
+    shard_eligible,
+    worker_id_for_config,
+    worker_shard_dir,
 )
 from rampart.reporting.sink import ReportSink
 
@@ -68,6 +78,7 @@ __all__ = [
     "pytest_addoption",
     "pytest_collection_modifyitems",
     "pytest_configure",
+    "pytest_configure_node",
     "pytest_sessionfinish",
     "pytest_terminal_summary",
     "pytest_testnodedown",
@@ -76,6 +87,8 @@ __all__ = [
 
 _rampart_key = pytest.StashKey[RampartSession]()
 _session_start_key = pytest.StashKey[float]()
+_shard_dir_key = pytest.StashKey[Path]()
+_shard_writer_key = pytest.StashKey[ShardWriter]()
 
 # Module-level constants are an acceptable exception in a hook-based
 # plugin module where there is no natural owning class.
@@ -194,6 +207,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         ),
         default=None,
     )
+    group.addoption(
+        "--rampart-keep-shards",
+        dest="rampart_keep_shards",
+        action="store_true",
+        default=False,
+        help=(
+            "Preserve per-worker xdist result shard files after the run "
+            "instead of deleting them (useful for debugging)."
+        ),
+    )
 
 
 def _default_handler_factory() -> list[ExecutionEventHandler]:
@@ -218,6 +241,53 @@ def pytest_configure(config: pytest.Config) -> None:
 
     config.stash[_rampart_key] = RampartSession()
     config.stash[_session_start_key] = time.monotonic()
+    _setup_shard_transport(config=config)
+
+
+def _setup_shard_transport(*, config: pytest.Config) -> None:
+    """Provision durable shard transport for the current process.
+
+    On a shard-eligible controller, creates the shared shard directory
+    and stashes it (pushed to workers by ``pytest_configure_node``). On a
+    worker that the controller pointed at a shard directory, opens the
+    worker's :class:`ShardWriter`. A no-op for single-process runs and
+    remote/inline-transport runs.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+    """
+    if is_xdist_worker(config=config):
+        shard_dir = worker_shard_dir(config=config)
+        if shard_dir is not None:
+            config.stash[_shard_writer_key] = build_shard_writer(
+                config=config,
+                shard_dir=Path(shard_dir),
+                worker_id=worker_id_for_config(config=config),
+            )
+        return
+    if is_xdist_controller(config=config) and shard_eligible(config=config):
+        config.stash[_shard_dir_key] = create_shard_dir()
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node: object) -> None:
+    """Push the controller's shard directory into a worker's input.
+
+    Registered as ``optionalhook`` so pytest does not warn when
+    pytest-xdist is not installed. The directory is only forwarded when
+    the controller provisioned one (a shard-eligible run); otherwise the
+    worker falls back to the inline ``workeroutput`` transport.
+
+    Args:
+        node: The xdist ``WorkerController`` being configured.
+    """
+    config = getattr(node, "config", None)
+    if config is None:
+        return
+    shard_dir = config.stash.get(_shard_dir_key, None)
+    workerinput = getattr(node, "workerinput", None)
+    if shard_dir is not None and isinstance(workerinput, dict):
+        cast("dict[str, Any]", workerinput)[SHARD_DIR_KEY] = str(shard_dir)
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
@@ -227,10 +297,32 @@ def pytest_unconfigure(config: pytest.Config) -> None:
         config (pytest.Config): The pytest configuration object.
     """
     clear_default_handler_factory()
+    _teardown_shard_transport(config=config)
     if _rampart_key in config.stash:
         del config.stash[_rampart_key]
     if _session_start_key in config.stash:
         del config.stash[_session_start_key]
+
+
+def _teardown_shard_transport(*, config: pytest.Config) -> None:
+    """Close any open shard writer and remove the controller's shard dir.
+
+    The controller's shard directory is preserved when
+    ``--rampart-keep-shards`` is set. Closing the writer is idempotent,
+    so this is safe even after ``pytest_sessionfinish`` already closed it.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+    """
+    writer = config.stash.get(_shard_writer_key, None)
+    if writer is not None:
+        writer.close()
+        del config.stash[_shard_writer_key]
+    shard_dir = config.stash.get(_shard_dir_key, None)
+    if shard_dir is not None:
+        if not config.getoption("rampart_keep_shards", default=False):
+            remove_shard_dir(shard_dir=shard_dir)
+        del config.stash[_shard_dir_key]
 
 
 def _copy_markers_to_clone(*, source: pytest.Item, clone: pytest.Item) -> None:
@@ -415,6 +507,41 @@ def _absorb_results(
         )
 
 
+def _append_result_shard(
+    *,
+    config: pytest.Config,
+    rampart_session: RampartSession,
+    nodeid: str,
+) -> None:
+    """Append a test's just-absorbed results to the worker's shard file.
+
+    A no-op unless this process is a shard-using xdist worker. Each
+    result is flushed to disk immediately so results already produced
+    survive an abrupt worker death. Failures are logged and swallowed so
+    shard I/O never breaks a test run; a missing record is later
+    surfaced by the controller's completeness check.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+        rampart_session (RampartSession): The session holding the tagged
+            results for ``nodeid``.
+        nodeid (str): The nodeid whose results to persist.
+    """
+    writer = config.stash.get(_shard_writer_key, None)
+    if writer is None:
+        return
+    try:
+        for result in rampart_session.results_by_nodeid.get(nodeid, []):
+            index = result.metadata.get("_rampart_result_index", 0)
+            writer.write(nodeid=nodeid, index=int(cast("int", index)), result=result)
+    except Exception:  # noqa: BLE001  — shard I/O must not break test runs
+        logger.warning(
+            "Failed to append shard records for %s — a result may be lost.",
+            nodeid,
+            exc_info=True,
+        )
+
+
 @pytest.fixture(autouse=True)
 def _rampart_collect(  # pytest discovers this via autouse=True
     request: pytest.FixtureRequest,
@@ -441,6 +568,11 @@ def _rampart_collect(  # pytest discovers this via autouse=True
     deactivate_collector(token)
     if rampart_session is not None:
         _absorb_results(rampart_session=rampart_session, node=node, collector=collector)
+        _append_result_shard(
+            config=request.config,
+            rampart_session=rampart_session,
+            nodeid=node.nodeid,
+        )
 
     # Note: collector.results returns a copy of the internal list,
     # so reading it after deactivation and absorption is safe.
@@ -712,10 +844,7 @@ def pytest_sessionfinish(
         rampart_session.set_duration(duration_seconds=time.monotonic() - start_time)
 
     if is_xdist_worker(config=session.config):
-        try:
-            finalize_worker(config=session.config, session=rampart_session)
-        except SizeLimitError as exc:
-            logger.warning("%s", exc)
+        _finalize_worker_transport(config=session.config, session=rampart_session)
         return
 
     _aggregate_trial_results(rampart_session=rampart_session)
@@ -757,7 +886,39 @@ def pytest_testnodedown(node: object, error: object) -> None:
     rampart_session = config.stash.get(_rampart_key, None)
     if rampart_session is None:
         return
-    handle_testnodedown(session=rampart_session, node=node, error=error)
+    shard_dir = config.stash.get(_shard_dir_key, None)
+    handle_testnodedown(
+        session=rampart_session,
+        node=node,
+        error=error,
+        shard_dir=shard_dir,
+    )
+
+
+def _finalize_worker_transport(
+    *,
+    config: pytest.Config,
+    session: RampartSession,
+) -> None:
+    """Flush a worker's results to the controller via its transport.
+
+    A shard-using worker closes its shard file and writes only a
+    completion sentinel; an inline worker serializes its full payload
+    into ``workeroutput`` (subject to the aggregate size cap).
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+        session (RampartSession): The worker's session state.
+    """
+    writer = config.stash.get(_shard_writer_key, None)
+    if writer is not None:
+        writer.close()
+        finalize_worker_shards(config=config, session=session)
+        return
+    try:
+        finalize_worker(config=config, session=session)
+    except SizeLimitError as exc:
+        logger.warning("%s", exc)
 
 
 def _record_xdist_metadata(

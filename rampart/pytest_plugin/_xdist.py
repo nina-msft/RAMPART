@@ -21,8 +21,11 @@ from __future__ import annotations
 import json
 import logging
 import math
+import shutil
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from rampart.common.text import strip_ansi as _strip_ansi_impl
@@ -49,7 +52,6 @@ from rampart.reporting.sink import ReportSink
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     import pytest
 
@@ -66,6 +68,12 @@ MAX_METADATA_DEPTH: int = 6
 _TRUNCATED_MARKER: str = "rampart_truncated"
 
 SHARD_DIR_KEY: str = "rampart_shard_dir"
+WORKER_ID_KEY: str = "workerid"
+
+TRANSPORT_KEY: str = "transport"
+TRANSPORT_SHARD: str = "shard"
+TRANSPORT_INLINE: str = "inline"
+EXPECTED_COUNT_KEY: str = "expected_record_count"
 
 
 class WorkerOutputError(Exception):
@@ -509,16 +517,29 @@ def serialize_worker_data(*, session: RampartSession) -> dict[str, Any]:
         ]
     return {
         "schema": SCHEMA_VERSION,
+        TRANSPORT_KEY: TRANSPORT_INLINE,
         "results_by_nodeid": serialized,
-        "trial_specs": [
-            {
-                "clone_nodeid": clone_nodeid,
-                "base_nodeid": spec.base_nodeid,
-                "threshold": _safe_float(value=spec.threshold) or 0.0,
-            }
-            for clone_nodeid, spec in session.trial_specs.items()
-        ],
+        "trial_specs": _serialize_trial_specs(session=session),
     }
+
+
+def _serialize_trial_specs(*, session: RampartSession) -> list[dict[str, Any]]:
+    """Serialize a session's registered trial specs to JSON-safe records.
+
+    Args:
+        session (RampartSession): The session whose trial specs to encode.
+
+    Returns:
+        list[dict[str, Any]]: One record per clone nodeid.
+    """
+    return [
+        {
+            "clone_nodeid": clone_nodeid,
+            "base_nodeid": spec.base_nodeid,
+            "threshold": _safe_float(value=spec.threshold) or 0.0,
+        }
+        for clone_nodeid, spec in session.trial_specs.items()
+    ]
 
 
 def _validate_schema(*, data: object) -> dict[str, Any]:
@@ -987,6 +1008,85 @@ class ShardWriter:
         self._file.close()
 
 
+def create_shard_dir(*, prefix: str = "rampart-xdist-") -> Path:
+    """Create a fresh directory to hold per-worker shard files.
+
+    Args:
+        prefix (str): Prefix for the temporary directory name.
+
+    Returns:
+        Path: The absolute path of the newly created directory.
+    """
+    return Path(tempfile.mkdtemp(prefix=prefix))
+
+
+def remove_shard_dir(*, shard_dir: Path) -> None:
+    """Recursively remove a shard directory, ignoring missing files.
+
+    Args:
+        shard_dir (Path): The shard directory to delete.
+    """
+    shutil.rmtree(shard_dir, ignore_errors=True)
+
+
+def build_shard_writer(
+    *,
+    config: pytest.Config,
+    shard_dir: Path,
+    worker_id: str,
+) -> ShardWriter:
+    """Build a :class:`ShardWriter` using the configured per-record cap.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+        shard_dir (Path): Directory holding per-worker shard files.
+        worker_id (str): The xdist worker id (e.g. ``"gw0"``).
+
+    Returns:
+        ShardWriter: An open writer for this worker's shard file.
+    """
+    return ShardWriter(
+        shard_dir=shard_dir,
+        worker_id=worker_id,
+        size_limit=_size_limit(config=config),
+    )
+
+
+def worker_shard_dir(*, config: pytest.Config) -> str | None:
+    """Return the controller-provisioned shard directory for this worker.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+
+    Returns:
+        str | None: The shard directory path pushed into
+            ``workerinput`` by the controller, or None when the run is
+            not using shard transport.
+    """
+    workerinput = cast(
+        "dict[str, Any]",
+        config.workerinput,  # ty: ignore[unresolved-attribute]
+    )
+    value = workerinput.get(SHARD_DIR_KEY)
+    return str(value) if value else None
+
+
+def worker_id_for_config(*, config: pytest.Config) -> str:
+    """Return the current xdist worker's id from ``workerinput``.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+
+    Returns:
+        str: The worker id (e.g. ``"gw0"``), or ``"unknown"`` if absent.
+    """
+    workerinput = cast(
+        "dict[str, Any]",
+        config.workerinput,  # ty: ignore[unresolved-attribute]
+    )
+    return str(workerinput.get(WORKER_ID_KEY, "unknown"))
+
+
 def _absorb_shard_record(
     *,
     record: dict[str, Any],
@@ -1196,6 +1296,51 @@ def finalize_worker(*, config: pytest.Config, session: RampartSession) -> None:
     workeroutput[WORKEROUTPUT_KEY] = payload
 
 
+def serialize_worker_sentinel(*, session: RampartSession) -> dict[str, Any]:
+    """Serialize a shard-transport worker's completion sentinel.
+
+    A shard-using worker streams its result bodies to its on-disk shard
+    during the run, so the ``workeroutput`` channel carries only a small
+    sentinel: the schema, the ``"shard"`` transport marker, the count of
+    results the worker recorded (for the controller's completeness
+    check), and the trial specs (which never touch the shard file).
+
+    Args:
+        session (RampartSession): The worker's session state.
+
+    Returns:
+        dict[str, Any]: The JSON-safe sentinel payload.
+    """
+    expected = sum(len(results) for results in session.results_by_nodeid.values())
+    return {
+        "schema": SCHEMA_VERSION,
+        TRANSPORT_KEY: TRANSPORT_SHARD,
+        EXPECTED_COUNT_KEY: expected,
+        "trial_specs": _serialize_trial_specs(session=session),
+    }
+
+
+def finalize_worker_shards(*, config: pytest.Config, session: RampartSession) -> None:
+    """Write the shard-transport completion sentinel to ``workeroutput``.
+
+    Called from ``pytest_sessionfinish`` on a shard-using worker once its
+    shard file is closed. Unlike :func:`finalize_worker`, no result
+    bodies travel inline (the controller reads them from the shard), so
+    there is no aggregate size cap to enforce.
+
+    Args:
+        config (pytest.Config): The pytest configuration object.
+        session (RampartSession): The worker's session state.
+    """
+    if not is_xdist_worker(config=config):
+        return
+    workeroutput = cast(
+        "dict[str, Any]",
+        config.workeroutput,  # ty: ignore[unresolved-attribute]
+    )
+    workeroutput[WORKEROUTPUT_KEY] = serialize_worker_sentinel(session=session)
+
+
 def _safe_deserialize_trial_specs(
     *,
     payload: object,
@@ -1245,26 +1390,95 @@ def _tag_source_worker(
             result.metadata["_rampart_source_worker"] = worker_id_str
 
 
+def _worker_identity(*, node: object) -> str:
+    """Return a stable identifier string for an xdist worker node.
+
+    Args:
+        node: The xdist worker node.
+
+    Returns:
+        str: The worker's gateway id (e.g. ``"gw0"``) when available,
+            otherwise the node's own string form.
+    """
+    gateway = getattr(node, "gateway", None)
+    return str(getattr(gateway, "id", node)) if gateway else str(node)
+
+
+def _extract_worker_payload(*, node: object) -> dict[str, Any] | None:
+    """Return the RAMPART payload dict from a worker node, or None.
+
+    Args:
+        node: The xdist worker node.
+
+    Returns:
+        dict[str, Any] | None: The ``WORKEROUTPUT_KEY`` payload when it
+            is a dict, else None.
+    """
+    workeroutput = getattr(node, "workeroutput", None)
+    if not isinstance(workeroutput, dict):
+        return None
+    payload = cast("dict[str, Any]", workeroutput).get(WORKEROUTPUT_KEY)
+    return cast("dict[str, Any]", payload) if isinstance(payload, dict) else None
+
+
 def handle_testnodedown(
     *,
     session: RampartSession,
     node: object,
     error: object,
+    shard_dir: Path | None = None,
 ) -> None:
     """Merge a finished worker's results into the controller session.
 
-    Called from ``pytest_testnodedown`` on the controller for each
-    worker that completes. Failures (missing payload, deserialization
-    errors, worker crashes) are recorded via ``mark_incomplete`` rather
-    than raised, so a single bad worker does not abort report emission.
+    Dispatches on the worker's transport. When ``shard_dir`` is set (the
+    run is shard-eligible), result bodies are recovered from the worker's
+    on-disk shard so results a killed worker already produced survive;
+    otherwise the legacy inline ``workeroutput`` payload is used. Failures
+    are recorded via ``mark_incomplete`` rather than raised, so a single
+    bad worker does not abort report emission.
 
     Args:
         session (RampartSession): The controller's session state.
         node: The xdist node object (has ``workeroutput`` attribute).
         error: The shutdown error from xdist, or None on clean exit.
+        shard_dir (Path | None): The controller's shard directory when
+            the run uses durable shard transport, else None.
     """
-    worker_id = getattr(node, "gateway", None)
-    worker_id_str = str(getattr(worker_id, "id", node)) if worker_id else str(node)
+    worker_id_str = _worker_identity(node=node)
+    payload = _extract_worker_payload(node=node)
+    transport = payload.get(TRANSPORT_KEY) if isinstance(payload, dict) else None
+    if shard_dir is not None and transport != TRANSPORT_INLINE:
+        _merge_shard_worker(
+            session=session,
+            shard_dir=shard_dir,
+            worker_id_str=worker_id_str,
+            payload=payload,
+            error=error,
+        )
+        return
+    _merge_inline_worker(
+        session=session,
+        node=node,
+        error=error,
+        worker_id_str=worker_id_str,
+    )
+
+
+def _merge_inline_worker(
+    *,
+    session: RampartSession,
+    node: object,
+    error: object,
+    worker_id_str: str,
+) -> None:
+    """Merge a worker that transported its results inline via workeroutput.
+
+    Args:
+        session (RampartSession): The controller's session state.
+        node: The xdist worker node.
+        error: The shutdown error from xdist, or None on clean exit.
+        worker_id_str (str): The originating worker identifier.
+    """
     if error is not None:
         logger.warning(
             "Worker %s reported shutdown error; report will be incomplete: %s",
@@ -1302,8 +1516,28 @@ def handle_testnodedown(
             reason=f"worker {worker_id_str} payload truncated (size cap)",
         )
         return
+    _merge_inline_payload(
+        session=session,
+        payload=cast("object", payload),
+        worker_id_str=worker_id_str,
+    )
+
+
+def _merge_inline_payload(
+    *,
+    session: RampartSession,
+    payload: object,
+    worker_id_str: str,
+) -> None:
+    """Deserialize and merge a validated inline worker payload.
+
+    Args:
+        session (RampartSession): The controller's session state.
+        payload (object): The inline worker payload.
+        worker_id_str (str): The originating worker identifier.
+    """
     try:
-        results_by_nodeid = deserialize_worker_data(data=cast("object", payload))
+        results_by_nodeid = deserialize_worker_data(data=payload)
     except WorkerOutputError as exc:
         logger.exception(
             "Failed to deserialize worker %s output; report will be incomplete.",
@@ -1314,13 +1548,10 @@ def handle_testnodedown(
         )
         return
     trial_specs = _safe_deserialize_trial_specs(
-        payload=cast("object", payload),
+        payload=payload,
         worker_id_str=worker_id_str,
     )
-    _tag_source_worker(
-        results_by_nodeid=results_by_nodeid,
-        worker_id_str=worker_id_str,
-    )
+    _tag_source_worker(results_by_nodeid=results_by_nodeid, worker_id_str=worker_id_str)
     session.merge_worker_results(results_by_nodeid=results_by_nodeid)
     if trial_specs:
         session.merge_trial_specs(trial_specs=trial_specs)
@@ -1329,6 +1560,122 @@ def handle_testnodedown(
         len(results_by_nodeid),
         worker_id_str,
     )
+
+
+def _merge_shard_worker(
+    *,
+    session: RampartSession,
+    shard_dir: Path,
+    worker_id_str: str,
+    payload: dict[str, Any] | None,
+    error: object,
+) -> None:
+    """Recover and merge a worker's results from its durable shard file.
+
+    Results the worker already flushed to disk are recovered even when
+    the worker crashed (``error`` set) or never wrote a completion
+    sentinel. Any shortfall against the sentinel's expected count, a
+    crash, or a missing sentinel marks the run incomplete without
+    discarding the results that did survive.
+
+    Args:
+        session (RampartSession): The controller's session state.
+        shard_dir (Path): The controller's shard directory.
+        worker_id_str (str): The originating worker identifier.
+        payload (dict[str, Any] | None): The worker's completion
+            sentinel, or None when it never arrived.
+        error: The shutdown error from xdist, or None on clean exit.
+    """
+    results_by_nodeid, dropped = read_worker_shard(
+        shard_dir=shard_dir,
+        worker_id=worker_id_str,
+    )
+    _tag_source_worker(results_by_nodeid=results_by_nodeid, worker_id_str=worker_id_str)
+    session.merge_worker_results(results_by_nodeid=results_by_nodeid)
+    _merge_shard_trial_specs(
+        session=session,
+        payload=payload,
+        worker_id_str=worker_id_str,
+    )
+    recovered = sum(len(results) for results in results_by_nodeid.values())
+    reason = _shard_incomplete_reason(
+        worker_id_str=worker_id_str,
+        payload=payload,
+        error=error,
+        recovered=recovered,
+        dropped=dropped,
+    )
+    if reason is not None:
+        session.mark_incomplete(reason=reason)
+    logger.info(
+        "Recovered %d result(s) from worker %s shard.",
+        recovered,
+        worker_id_str,
+    )
+
+
+def _merge_shard_trial_specs(
+    *,
+    session: RampartSession,
+    payload: dict[str, Any] | None,
+    worker_id_str: str,
+) -> None:
+    """Merge trial specs carried by a shard worker's sentinel payload.
+
+    Args:
+        session (RampartSession): The controller's session state.
+        payload (dict[str, Any] | None): The completion sentinel, if any.
+        worker_id_str (str): The originating worker identifier.
+    """
+    if payload is None:
+        return
+    trial_specs = _safe_deserialize_trial_specs(
+        payload=payload,
+        worker_id_str=worker_id_str,
+    )
+    if trial_specs:
+        session.merge_trial_specs(trial_specs=trial_specs)
+
+
+def _shard_incomplete_reason(
+    *,
+    worker_id_str: str,
+    payload: dict[str, Any] | None,
+    error: object,
+    recovered: int,
+    dropped: list[DroppedRecord],
+) -> str | None:
+    """Return why a shard worker's recovery is incomplete, or None.
+
+    Args:
+        worker_id_str (str): The originating worker identifier.
+        payload (dict[str, Any] | None): The completion sentinel, if any.
+        error: The shutdown error from xdist, or None on clean exit.
+        recovered (int): The number of results read back from the shard.
+        dropped (list[DroppedRecord]): Records the shard reader dropped.
+
+    Returns:
+        str | None: An incompleteness reason, or None when the worker's
+            results were recovered in full.
+    """
+    if error is not None:
+        return (
+            f"worker {worker_id_str} crashed; "
+            f"recovered {recovered} result(s) from shard"
+        )
+    if payload is None or payload.get(TRANSPORT_KEY) != TRANSPORT_SHARD:
+        return (
+            f"worker {worker_id_str} missing shard completion sentinel; "
+            f"recovered {recovered} result(s)"
+        )
+    expected = payload.get(EXPECTED_COUNT_KEY)
+    if isinstance(expected, int) and recovered < expected:
+        suffix = f" ({len(dropped)} dropped)" if dropped else ""
+        return (
+            f"worker {worker_id_str} recovered {recovered} of "
+            f"{expected} result(s){suffix}"
+        )
+    return None
 
 
 def discover_sinks_from_conftest(*, config: pytest.Config) -> list[ReportSink]:

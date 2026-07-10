@@ -34,10 +34,14 @@ from rampart.core.types import (
 from rampart.pytest_plugin._session import RampartSession, TrialSpec
 from rampart.pytest_plugin._xdist import (
     DEFAULT_SIZE_LIMIT_BYTES,
+    EXPECTED_COUNT_KEY,
     MAX_METADATA_DEPTH,
     SCHEMA_VERSION,
     SHARD_DIR_KEY,
     SIZE_LIMIT_OPTION,
+    TRANSPORT_INLINE,
+    TRANSPORT_KEY,
+    TRANSPORT_SHARD,
     WORKEROUTPUT_KEY,
     DroppedRecord,
     SchemaVersionError,
@@ -46,10 +50,12 @@ from rampart.pytest_plugin._xdist import (
     WorkerOutputError,
     _sanitize,
     _strip_ansi,
+    build_shard_writer,
     deserialize_trial_specs,
     deserialize_worker_data,
     discover_sinks_from_conftest,
     finalize_worker,
+    finalize_worker_shards,
     get_dist_mode,
     get_worker_count,
     handle_testnodedown,
@@ -57,7 +63,10 @@ from rampart.pytest_plugin._xdist import (
     is_xdist_worker,
     read_worker_shard,
     serialize_worker_data,
+    serialize_worker_sentinel,
     shard_eligible,
+    worker_id_for_config,
+    worker_shard_dir,
 )
 from rampart.reporting.sink import ReportSink, TestRunReport
 
@@ -1305,3 +1314,245 @@ class TestReadWorkerShard:
         assert len(recovered.turns) == 1
         assert recovered.turns[0].eval_result is not None
         assert recovered.turns[0].eval_result.outcome is EvalOutcome.DETECTED
+
+
+def _write_shard(
+    *,
+    shard_dir: Path,
+    worker_id: str,
+    results_by_nodeid: dict[str, list[Result]],
+    size_limit: int = DEFAULT_SIZE_LIMIT_BYTES,
+) -> None:
+    writer = ShardWriter(
+        shard_dir=shard_dir,
+        worker_id=worker_id,
+        size_limit=size_limit,
+    )
+    for nodeid, results in results_by_nodeid.items():
+        for index, result in enumerate(results):
+            writer.write(nodeid=nodeid, index=index, result=result)
+    writer.close()
+
+
+def _shard_node(*, worker_id: str, payload: object) -> Any:
+    node = MagicMock()
+    node.gateway.id = worker_id
+    node.workeroutput = payload
+    return node
+
+
+class TestInlineTransportStamp:
+    def test_serialize_worker_data_stamps_inline(self) -> None:
+        session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="x")]},
+        )
+        payload = serialize_worker_data(session=session)
+        assert payload[TRANSPORT_KEY] == TRANSPORT_INLINE
+
+    def test_inline_payload_still_round_trips(self) -> None:
+        session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="x")]},
+        )
+        payload = serialize_worker_data(session=session)
+        merged = deserialize_worker_data(data=payload)
+        assert merged["n"][0].summary == "x"
+
+
+class TestSerializeWorkerSentinel:
+    def test_counts_all_results(self) -> None:
+        session = _make_session_with_results(
+            results_by_nodeid={
+                "a": [_make_result(), _make_result()],
+                "b": [_make_result()],
+            },
+        )
+        sentinel = serialize_worker_sentinel(session=session)
+        assert sentinel[TRANSPORT_KEY] == TRANSPORT_SHARD
+        assert sentinel[EXPECTED_COUNT_KEY] == 3
+        assert sentinel["schema"] == SCHEMA_VERSION
+
+    def test_carries_no_result_bodies(self) -> None:
+        session = _make_session_with_results(
+            results_by_nodeid={"a": [_make_result()]},
+        )
+        sentinel = serialize_worker_sentinel(session=session)
+        assert "results_by_nodeid" not in sentinel
+
+    def test_carries_trial_specs(self) -> None:
+        session = RampartSession()
+        session.register_trial_spec(
+            clone_nodeid="t.py::x[trial-0]",
+            base_nodeid="t.py::x",
+            threshold=0.8,
+        )
+        sentinel = serialize_worker_sentinel(session=session)
+        assert sentinel["trial_specs"][0]["clone_nodeid"] == "t.py::x[trial-0]"
+
+
+class TestFinalizeWorkerShards:
+    def test_no_op_on_controller(self) -> None:
+        config = _make_config(is_worker=False, numprocesses=2)
+        workeroutput: dict[str, Any] = {}
+        config.workeroutput = workeroutput
+        finalize_worker_shards(config=config, session=RampartSession())
+        assert WORKEROUTPUT_KEY not in workeroutput
+
+    def test_writes_sentinel_on_worker(self) -> None:
+        config = _make_config(is_worker=True)
+        workeroutput: dict[str, Any] = {}
+        config.workeroutput = workeroutput
+        session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(), _make_result()]},
+        )
+        finalize_worker_shards(config=config, session=session)
+        payload = workeroutput[WORKEROUTPUT_KEY]
+        assert payload[TRANSPORT_KEY] == TRANSPORT_SHARD
+        assert payload[EXPECTED_COUNT_KEY] == 2
+
+
+class TestHandleTestnodedownShard:
+    def test_clean_merge_from_shard(self, tmp_path: Path) -> None:
+        _write_shard(
+            shard_dir=tmp_path,
+            worker_id="gw0",
+            results_by_nodeid={
+                "n": [_make_result(summary="a"), _make_result(summary="b")],
+            },
+        )
+        session = RampartSession()
+        node = _shard_node(
+            worker_id="gw0",
+            payload={
+                WORKEROUTPUT_KEY: {
+                    "schema": SCHEMA_VERSION,
+                    TRANSPORT_KEY: TRANSPORT_SHARD,
+                    EXPECTED_COUNT_KEY: 2,
+                    "trial_specs": [],
+                },
+            },
+        )
+        handle_testnodedown(session=session, node=node, error=None, shard_dir=tmp_path)
+        assert session.is_incomplete is False
+        assert len(session._results) == 2
+        assert session._results[0].metadata["_rampart_source_worker"] == "gw0"
+
+    def test_crash_recovers_partial_and_marks_incomplete(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_shard(
+            shard_dir=tmp_path,
+            worker_id="gw0",
+            results_by_nodeid={"n": [_make_result(summary="survived")]},
+        )
+        session = RampartSession()
+        node = _shard_node(worker_id="gw0", payload=None)
+        handle_testnodedown(
+            session=session,
+            node=node,
+            error="killed",
+            shard_dir=tmp_path,
+        )
+        assert session.is_incomplete is True
+        assert len(session._results) == 1
+        assert session._results[0].summary == "survived"
+
+    def test_count_shortfall_marks_incomplete(self, tmp_path: Path) -> None:
+        _write_shard(
+            shard_dir=tmp_path,
+            worker_id="gw0",
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        session = RampartSession()
+        node = _shard_node(
+            worker_id="gw0",
+            payload={
+                WORKEROUTPUT_KEY: {
+                    "schema": SCHEMA_VERSION,
+                    TRANSPORT_KEY: TRANSPORT_SHARD,
+                    EXPECTED_COUNT_KEY: 2,
+                    "trial_specs": [],
+                },
+            },
+        )
+        handle_testnodedown(session=session, node=node, error=None, shard_dir=tmp_path)
+        assert session.is_incomplete is True
+        assert len(session._results) == 1
+
+    def test_missing_sentinel_recovers_and_marks_incomplete(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        _write_shard(
+            shard_dir=tmp_path,
+            worker_id="gw0",
+            results_by_nodeid={"n": [_make_result(summary="kept")]},
+        )
+        session = RampartSession()
+        node = _shard_node(worker_id="gw0", payload={})
+        handle_testnodedown(session=session, node=node, error=None, shard_dir=tmp_path)
+        assert session.is_incomplete is True
+        assert len(session._results) == 1
+
+    def test_inline_stamp_takes_inline_path_despite_shard_dir(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"n": [_make_result(summary="inline")]},
+        )
+        payload = serialize_worker_data(session=worker_session)
+        session = RampartSession()
+        node = _shard_node(worker_id="gw0", payload={WORKEROUTPUT_KEY: payload})
+        handle_testnodedown(session=session, node=node, error=None, shard_dir=tmp_path)
+        assert session.is_incomplete is False
+        assert session._results[0].summary == "inline"
+
+    def test_merges_trial_specs_from_sentinel(self, tmp_path: Path) -> None:
+        worker_session = _make_session_with_results(
+            results_by_nodeid={"t.py::x[trial-0]": [_make_result()]},
+        )
+        worker_session.register_trial_spec(
+            clone_nodeid="t.py::x[trial-0]",
+            base_nodeid="t.py::x",
+            threshold=0.8,
+        )
+        _write_shard(
+            shard_dir=tmp_path,
+            worker_id="gw0",
+            results_by_nodeid={"t.py::x[trial-0]": [_make_result()]},
+        )
+        session = RampartSession()
+        node = _shard_node(
+            worker_id="gw0",
+            payload={
+                WORKEROUTPUT_KEY: serialize_worker_sentinel(session=worker_session),
+            },
+        )
+        handle_testnodedown(session=session, node=node, error=None, shard_dir=tmp_path)
+        assert "t.py::x[trial-0]" in session.trial_specs
+
+
+class TestWorkerShardHelpers:
+    def test_worker_shard_dir_returns_configured(self) -> None:
+        config = _make_config(is_worker=True)
+        config.workerinput[SHARD_DIR_KEY] = "/tmp/shards"
+        assert worker_shard_dir(config=config) == "/tmp/shards"
+
+    def test_worker_shard_dir_none_when_absent(self) -> None:
+        config = _make_config(is_worker=True)
+        assert worker_shard_dir(config=config) is None
+
+    def test_worker_id_for_config(self) -> None:
+        config = _make_config(is_worker=True)
+        assert worker_id_for_config(config=config) == "gw0"
+
+    def test_build_shard_writer_uses_size_limit(self, tmp_path: Path) -> None:
+        config = _make_config(is_worker=True, max_bytes=99)
+        writer = build_shard_writer(
+            config=config,
+            shard_dir=tmp_path,
+            worker_id="gw0",
+        )
+        assert writer._size_limit == 99
+        writer.close()

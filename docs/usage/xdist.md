@@ -40,10 +40,34 @@ serialize → workeroutput    serialize → workeroutput
         Single unified TestRunReport
 ```
 
-- **Workers** collect [`Result`][rampart.core.result.Result] objects normally and serialize them into `config.workeroutput`. Workers do **not** emit reports.
-- **Controller** receives each worker's payload via the `pytest_testnodedown` hook, merges results into its own [`RampartSession`][rampart.pytest_plugin._session.RampartSession], and emits sinks once at session end.
+- **Workers** collect [`Result`][rampart.core.result.Result] objects normally and hand them to the controller. Workers do **not** emit reports.
+- **Controller** receives each worker's results via the `pytest_testnodedown` hook, merges them into its own [`RampartSession`][rampart.pytest_plugin._session.RampartSession], and emits sinks once at session end.
 
 The result: **one** `JsonFileReportSink` output file, **one** call to `MyCustomSink.emit_async`, and accurate population statistics over the full result set.
+
+### Result transport
+
+How a worker's results reach the controller depends on the run topology:
+
+- **Durable shard transport (local `popen` workers).** For a plain `pytest -n N`
+  run — or any `--tx` topology where every gateway is a local `popen` — each
+  worker streams every finished result to its own on-disk JSONL shard,
+  flushing after each write. The controller reads the shards back in
+  `pytest_testnodedown`. Because results hit disk as soon as they finish, a
+  worker that is killed mid-run **keeps every result it had already produced**,
+  and the size cap applies **per record** (see [Size cap](#size-cap)).
+- **Inline fallback (remote or proxied workers).** When any gateway is remote
+  (`--tx=ssh=…`, `--tx=socket=…`) or routed through a `via` proxy, the
+  controller cannot read a worker-local shard file, so RAMPART falls back to the
+  legacy transport: each worker serializes its full result set into
+  `config.workeroutput` once at its clean `pytest_sessionfinish`. This is the
+  batch-at-end behavior — a worker killed before session finish contributes
+  nothing, and the size cap applies to the whole payload.
+
+Both transports feed the same merge-and-emit path, so reports are identical
+apart from the durability characteristics above. Shard files live in a private
+temporary directory and are deleted at the end of the run (pass
+`--rampart-keep-shards` to retain them for debugging).
 
 ---
 
@@ -179,7 +203,7 @@ Worker payloads cross a process boundary via `execnet` and may contain attacker-
 
 - **Arbitrary code execution** — strict JSON-safe primitives only; no `pickle`, `marshal`, or custom `__reduce__`.
 - **Schema drift** — payloads with missing or unknown schema versions are rejected fail-closed.
-- **Memory exhaustion** — worker payloads are capped at 64 MB by default.
+- **Memory exhaustion** — result payloads are capped (64 MB by default). Under the durable shard transport the cap is applied **per result record**; under the inline fallback it caps the whole worker payload.
 - **Terminal/log injection** — ANSI escape sequences are stripped from free-form text at the deserialization boundary.
 - **Path traversal** — worker-local artifact paths are stored as opaque strings in metadata; the controller never accesses worker files.
 
@@ -198,7 +222,15 @@ Or in `pytest.ini` / `pyproject.toml`:
 rampart_xdist_max_bytes = 134217728
 ```
 
-Workers that exceed the cap log a warning and emit a truncation marker. The controller records the affected worker as incomplete in `TestRunReport.metadata`.
+**Under the durable shard transport** (local `popen` workers) the cap is applied
+**per result record**: a single oversized result is written to the shard as a
+truncation marker and dropped, while every other result from the same worker is
+recovered normally. The controller records the run as incomplete in
+`TestRunReport.metadata`, naming how many records were recovered and dropped.
+
+**Under the inline fallback** (remote/proxied workers) the cap applies to the
+worker's whole serialized payload: exceeding it drops the entire payload and
+marks that worker incomplete.
 
 ---
 
@@ -227,27 +259,34 @@ report.metadata["dist_mode"]      # "load", "loadgroup", etc.
 
 ---
 
-## Durability limitations
+## Durability
 
-The current worker→controller transport flushes a worker's results only at its
-clean `pytest_sessionfinish`. This has two consequences you should be aware of:
+For local `pytest -n N` runs (and any all-`popen` `--tx` topology), RAMPART uses
+a **durable per-worker shard transport**: each worker streams every finished
+result to its own on-disk JSONL shard, flushing after each write. This gives two
+guarantees the earlier batch-at-end transport could not:
 
-- **A worker killed mid-run loses its already-finished results.** Because results
-  are shipped in a single batch at session end, a worker that crashes, is killed
-  (e.g. OOM, timeout, `-x` shutdown), or otherwise never reaches
-  `pytest_sessionfinish` contributes **nothing** — even tests it had already
-  completed. The run is marked incomplete (see [Incomplete Runs](#incomplete-runs)).
-- **The size cap drops the whole worker payload, not just the oversized record.**
-  When a worker's aggregate serialized payload exceeds
-  `--rampart-xdist-max-bytes`, the **entire** worker payload is dropped (and the
-  worker marked incomplete), rather than only the single oversized transcript.
+- **A worker killed mid-run keeps its already-finished results.** Because each
+  result hits disk the moment it completes, a worker that crashes, is killed
+  (OOM, timeout, `-x` shutdown), or otherwise never reaches
+  `pytest_sessionfinish` still contributes every test it had finished. The
+  controller recovers those results from the shard and marks the run incomplete
+  (see [Incomplete Runs](#incomplete-runs)), rather than losing the worker's
+  entire contribution.
+- **The size cap drops only the oversized record.** When one result exceeds
+  `--rampart-xdist-max-bytes`, just that record is dropped; the worker's other
+  results are recovered normally (see [Size cap](#size-cap)).
 
-Both behaviors are deliberate fail-closed choices for this release. A durable
-per-worker transport (incremental JSONL shards that survive a killed worker, with
-the size cap applied per-record) is in progress as a follow-up change; until it
-lands, use `--dist=loadgroup` only when your trial groups need worker cohesion (see
-[Choosing `loadgroup` vs `load`](#choosing-loadgroup-vs-load)) and size your cap to
-your largest expected worker payload.
+### Remote topologies fall back to the inline transport
+
+The shard transport requires the controller to read worker-local files, so it is
+used **only** when every gateway is a local `popen` process. Remote (`--tx=ssh`,
+`--tx=socket`) or `via`-proxied topologies transparently fall back to the inline
+`workeroutput` transport, which retains the earlier characteristics: results ship
+in a single batch at a worker's clean `pytest_sessionfinish` (a worker killed
+before then contributes nothing), and the size cap drops the whole worker
+payload. Size your cap to your largest expected payload when running remote
+workers.
 
 ---
 
@@ -256,9 +295,10 @@ your largest expected worker payload.
 - Sinks discovered through the **fixture fallback** on the controller cannot depend
   on other pytest fixtures — use the `pytest_rampart_sinks` hook instead (see
   [Registering Sinks](#registering-sinks-the-pytest_rampart_sinks-hook)).
-- Results from a worker that dies before `pytest_sessionfinish` are lost, and an
-  over-cap worker payload is dropped wholesale (see
-  [Durability limitations](#durability-limitations)).
+- On **local** (`popen`) workers, results survive a worker killed mid-run and the
+  size cap is per-record. On **remote/proxied** workers RAMPART falls back to the
+  inline transport, where a worker that dies before `pytest_sessionfinish` is lost
+  and an over-cap payload is dropped wholesale (see [Durability](#durability)).
 - Mixed RAMPART versions across controller and workers are unsupported; install the
   same version everywhere.
 - `pytest-xdist` itself does not support interactive debugging (`--pdb`, `--trace`);

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -69,6 +70,7 @@ class _ConfigStub:
     def __init__(self) -> None:
         self._ini_lines: list[tuple[str, str]] = []
         self.stash = _StashStub()
+        self.option = SimpleNamespace()
 
     def addinivalue_line(self, name: str, line: str) -> None:
         """Record marker registrations."""
