@@ -133,7 +133,6 @@ class TestRoundTrip:
         encoded = serialize_result(
             result=_make_full_result(),
             identity="auto:mod::test",
-            origin="derived",
             case_id="case-0",
             pytest_nodeid="tests/test_x.py::test_x",
             result_index=2,
@@ -141,7 +140,6 @@ class TestRoundTrip:
 
         assert encoded["identity"] == {
             "value": "auto:mod::test",
-            "origin": "derived",
             "case_id": "case-0",
         }
         assert encoded["pytest_nodeid"] == "tests/test_x.py::test_x"

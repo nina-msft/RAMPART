@@ -4,21 +4,15 @@
 """Canonical, versioned trace/result serialization for RAMPART.
 
 This module owns the *single* full-fidelity ``Result`` <-> ``dict`` round-trip
-for the whole framework (design gate WS0-05, Decision D6). xdist transport,
-failure attachments, reporting projections, and future replay all serialize
-through here rather than maintaining parallel serializers.
+for the whole framework.
 
 The canonical layer defines the supported *value domain* and nothing else. It
-does not apply transport hygiene — no ANSI stripping, no float normalization,
-no ``repr()``/``str()`` fallback, and no size capping. Those concerns wrap the
-canonical output at the transport boundary (xdist). When a value falls outside
-the canonical domain the codec fails closed with a field path rather than
-coercing, so a durable trace never silently loses fidelity.
+does not apply transport hygiene. When a value falls outside the canonical
+domain the codec fails closed with a field path rather than coercing it.
 
 Every serialized record carries a single root ``version`` field
 (:data:`TRACE_SCHEMA_VERSION`). Decoding dispatches on that version and fails
-closed on an unknown major. The record version is independent of the xdist
-transport envelope version; the two axes move separately.
+closed on an unknown major.
 """
 
 from __future__ import annotations
@@ -54,9 +48,12 @@ if TYPE_CHECKING:
 
 EnumT = TypeVar("EnumT", bound=Enum)
 
+# Single root schema version stamped on every serialized record.
 TRACE_SCHEMA_VERSION = "rampart.trace.v1"
-"""Single root schema version stamped on every serialized record."""
 
+# Top-level ``Result.metadata`` keys owned by the xdist transport. These
+# scheduling and bookkeeping values are stripped from the canonical body;
+# nested user maps are never touched.
 RESERVED_METADATA_KEYS: frozenset[str] = frozenset(
     {
         "_pytest_nodeid",
@@ -69,12 +66,6 @@ RESERVED_METADATA_KEYS: frozenset[str] = frozenset(
         "_rampart_worker_artifact_path",
     }
 )
-"""Top-level ``Result.metadata`` keys owned by the xdist transport.
-
-These are scheduling/bookkeeping breadcrumbs the transport stamps for its own
-reconciliation. They are stripped from the canonical body so a durable trace
-carries only intrinsic result data; nested user maps are never touched.
-"""
 
 
 class SchemaError(Exception):
@@ -103,8 +94,8 @@ class ResultRecord:
 
     Args:
         result (Result): The single-run verdict being serialized.
-        identity (dict[str, Any] | None): Stable test identity descriptor
-            (WS0-06). ``None`` until identity is wired at the producer.
+        identity (dict[str, Any] | None): Stable test identity descriptor.
+            ``None`` until identity is wired at the producer.
         pytest_nodeid (str | None): The pytest node id the result came from.
         result_index (int): Ordinal of this result within its test node.
     """
@@ -161,7 +152,6 @@ def serialize_result(
     *,
     result: Result,
     identity: str | None = None,
-    origin: str | None = None,
     case_id: str | None = None,
     pytest_nodeid: str | None = None,
     result_index: int = 0,
@@ -170,8 +160,7 @@ def serialize_result(
 
     Args:
         result (Result): The verdict to serialize.
-        identity (str | None): Stable identity value (WS0-06), if computed.
-        origin (str | None): How the identity was derived (marker vs. derived).
+        identity (str | None): Stable identity value, if computed.
         case_id (str | None): Parametrization case id, travelling beside identity.
         pytest_nodeid (str | None): The pytest node id the result came from.
         result_index (int): Ordinal of this result within its test node.
@@ -180,10 +169,9 @@ def serialize_result(
         dict[str, Any]: The canonical record dict, ready for any durable sink.
     """
     identity_descriptor: dict[str, Any] | None = None
-    if identity is not None or origin is not None or case_id is not None:
+    if identity is not None or case_id is not None:
         identity_descriptor = {
             "value": identity,
-            "origin": origin,
             "case_id": case_id,
         }
     record = ResultRecord(
@@ -331,11 +319,6 @@ def _encode_side_effect(*, effect: SideEffect, path: str) -> dict[str, Any]:
 def _encode_payload(*, payload: Payload, path: str) -> dict[str, Any]:
     """Encode a ``Payload``.
 
-    Binary payloads are persisted as content-addressed artifact descriptors by
-    WS7 rather than inline; that resolver does not exist at
-    ``rampart.trace.v1``, so a binary payload fails closed here instead of
-    inlining a machine-local path.
-
     Returns:
         dict[str, Any]: The encoded payload.
 
@@ -344,8 +327,8 @@ def _encode_payload(*, payload: Payload, path: str) -> dict[str, Any]:
     """
     if payload.format.is_binary:
         msg = (
-            f"{path}: binary payload format {payload.format.value!r} requires the "
-            f"WS7 artifact resolver, unsupported in {TRACE_SCHEMA_VERSION}."
+            f"{path}: binary payload format {payload.format.value!r} is unsupported "
+            f"in {TRACE_SCHEMA_VERSION}."
         )
         raise SchemaError(msg)
     return {
@@ -684,9 +667,6 @@ def _decode_side_effect(*, data: object, path: str) -> SideEffect:
 def _decode_payload(*, data: object, path: str) -> Payload:
     """Decode a ``Payload``.
 
-    A binary payload has no artifact resolver at ``rampart.trace.v1`` and fails
-    closed rather than being coerced to a text payload.
-
     Returns:
         Payload: The reconstructed payload.
 
@@ -701,8 +681,8 @@ def _decode_payload(*, data: object, path: str) -> Payload:
     )
     if payload_format.is_binary:
         msg = (
-            f"{path}: binary payload format {payload_format.value!r} requires the "
-            f"WS7 artifact resolver, unsupported in {TRACE_SCHEMA_VERSION}."
+            f"{path}: binary payload format {payload_format.value!r} is unsupported "
+            f"in {TRACE_SCHEMA_VERSION}."
         )
         raise SchemaError(msg)
     return Payload(
