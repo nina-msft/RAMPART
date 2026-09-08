@@ -104,6 +104,14 @@ class ResultRecord:
     pytest_nodeid: str | None = None
     result_index: int | None = None
 
+    def __post_init__(self) -> None:
+        """Validate record attribution fields.
+
+        Raises:
+            SchemaError: If ``result_index`` is not an integer or ``None``.
+        """
+        _validate_result_index(value=self.result_index)
+
     def to_dict(self) -> dict[str, Any]:
         """Encode the record into a canonical, JSON-safe dict.
 
@@ -209,7 +217,10 @@ def _encode_result(*, result: Result, path: str) -> dict[str, Any]:
             value=result.duration_seconds,
             path=f"{path}.duration_seconds",
         ),
-        "harm_category": _encode_harm_category(value=result.harm_category),
+        "harm_category": _encode_harm_category(
+            value=result.harm_category,
+            path=f"{path}.harm_category",
+        ),
         "strategy": result.strategy,
         "injections": [
             _encode_injection(record=record) for record in result.injections
@@ -391,15 +402,21 @@ def _encode_enum(*, value: Enum, path: str) -> str:
     return str(value.value)
 
 
-def _encode_harm_category(*, value: object) -> str | None:
+def _encode_harm_category(*, value: object, path: str) -> str | None:
     """Encode a harm category as a passthrough string.
 
     Returns:
         str | None: The category string, or ``None`` when unset.
+
+    Raises:
+        SchemaError: If ``value`` is not a string or ``None``.
     """
     if value is None:
         return None
-    return str(value)
+    if not isinstance(value, str):
+        msg = f"{path}: expected a string or null, got {type(value).__name__}."
+        raise SchemaError(msg)
+    return value
 
 
 def _encode_datetime(*, value: datetime | None) -> str | None:
@@ -413,7 +430,7 @@ def _encode_datetime(*, value: datetime | None) -> str | None:
     return value.isoformat()
 
 
-def _encode_float(*, value: float, path: str) -> float:
+def _encode_float(*, value: object, path: str) -> float:
     """Validate and pass through a float within the canonical domain.
 
     Returns:
@@ -501,14 +518,6 @@ def _decode_v1(data: Mapping[str, Any]) -> ResultRecord:
             f"got {type(pytest_nodeid).__name__}."
         )
         raise SchemaError(msg)
-    if result_index is not None and (
-        isinstance(result_index, bool) or not isinstance(result_index, int)
-    ):
-        msg = (
-            "record 'result_index' must be an integer or null, "
-            f"got {type(result_index).__name__}."
-        )
-        raise SchemaError(msg)
     return ResultRecord(
         result=_decode_result(data=body, path="result"),
         pytest_nodeid=pytest_nodeid,
@@ -536,17 +545,24 @@ def _decode_result(*, data: Mapping[str, Any], path: str) -> Result:
         ),
         turns=[
             _decode_turn(data=item, path=f"{path}.turns[{index}]")
-            for index, item in enumerate(_decode_list(value=data.get("turns")))
+            for index, item in enumerate(
+                _decode_list(value=data.get("turns"), path=f"{path}.turns")
+            )
         ],
         duration_seconds=_encode_float(
             value=data.get("duration_seconds", 0.0),
             path=f"{path}.duration_seconds",
         ),
-        harm_category=_decode_harm_category(value=data.get("harm_category")),
+        harm_category=_decode_harm_category(
+            value=data.get("harm_category"),
+            path=f"{path}.harm_category",
+        ),
         strategy=_decode_str(value=data.get("strategy", ""), path=f"{path}.strategy"),
         injections=[
             _decode_injection(data=item, path=f"{path}.injections[{index}]")
-            for index, item in enumerate(_decode_list(value=data.get("injections")))
+            for index, item in enumerate(
+                _decode_list(value=data.get("injections"), path=f"{path}.injections")
+            )
         ],
         population=_decode_population(
             value=data.get("population"),
@@ -601,7 +617,12 @@ def _decode_request(*, data: object, path: str) -> Request:
         prompt=prompt,
         attachments=[
             _decode_payload(data=item, path=f"{path}.attachments[{index}]")
-            for index, item in enumerate(_decode_list(value=typed.get("attachments")))
+            for index, item in enumerate(
+                _decode_list(
+                    value=typed.get("attachments"),
+                    path=f"{path}.attachments",
+                )
+            )
         ],
     )
 
@@ -617,11 +638,21 @@ def _decode_response(*, data: object, path: str) -> Response:
         text=_decode_str(value=typed.get("text", ""), path=f"{path}.text"),
         tool_calls=[
             _decode_tool_call(data=item, path=f"{path}.tool_calls[{index}]")
-            for index, item in enumerate(_decode_list(value=typed.get("tool_calls")))
+            for index, item in enumerate(
+                _decode_list(
+                    value=typed.get("tool_calls"),
+                    path=f"{path}.tool_calls",
+                )
+            )
         ],
         side_effects=[
             _decode_side_effect(data=item, path=f"{path}.side_effects[{index}]")
-            for index, item in enumerate(_decode_list(value=typed.get("side_effects")))
+            for index, item in enumerate(
+                _decode_list(
+                    value=typed.get("side_effects"),
+                    path=f"{path}.side_effects",
+                )
+            )
         ],
         metadata=dict(
             _decode_optional_map(value=typed.get("metadata"), path=f"{path}.metadata")
@@ -751,12 +782,10 @@ def _decode_population(*, value: object, path: str) -> PopulationRef | None:
         return None
     typed = _decode_map(value=value, path=path)
     return PopulationRef(
-        id=_decode_str(value=typed.get("id", ""), path=f"{path}.id"),
-        index=_decode_int(value=typed.get("index", 0), path=f"{path}.index"),
-        size=_decode_int(value=typed.get("size", 0), path=f"{path}.size"),
-        threshold=_encode_float(
-            value=typed.get("threshold", 0.0), path=f"{path}.threshold"
-        ),
+        id=_decode_str(value=typed.get("id"), path=f"{path}.id"),
+        index=_decode_int(value=typed.get("index"), path=f"{path}.index"),
+        size=_decode_int(value=typed.get("size"), path=f"{path}.size"),
+        threshold=_encode_float(value=typed.get("threshold"), path=f"{path}.threshold"),
     )
 
 
@@ -776,15 +805,21 @@ def _decode_enum(*, enum: type[EnumT], value: object, path: str) -> EnumT:
         raise SchemaError(msg) from exc
 
 
-def _decode_harm_category(*, value: object) -> str | None:
+def _decode_harm_category(*, value: object, path: str) -> str | None:
     """Decode a harm category as a passthrough string.
 
     Returns:
         str | None: The category string, or ``None``.
+
+    Raises:
+        SchemaError: If ``value`` is not a string or ``None``.
     """
     if value is None:
         return None
-    return str(value)
+    if not isinstance(value, str):
+        msg = f"{path}: expected a string or null, got {type(value).__name__}."
+        raise SchemaError(msg)
+    return value
 
 
 def _decode_datetime(*, value: object, path: str) -> datetime | None:
@@ -838,13 +873,21 @@ def _decode_int(*, value: object, path: str) -> int:
     return value
 
 
-def _decode_list(*, value: object) -> list[Any]:
-    """Coerce an optional wire list to a list.
+def _decode_list(*, value: object, path: str) -> list[Any]:
+    """Decode an optional wire list.
 
     Returns:
-        list[Any]: The list, or an empty list when absent.
+        list[Any]: The list, or an empty list when absent or ``None``.
+
+    Raises:
+        SchemaError: If ``value`` is present but not a list.
     """
-    return list(value) if isinstance(value, list) else []
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        msg = f"{path}: expected a list or null, got {type(value).__name__}."
+        raise SchemaError(msg)
+    return value
 
 
 def _decode_str_list(*, value: object, path: str) -> list[str]:
@@ -855,8 +898,26 @@ def _decode_str_list(*, value: object, path: str) -> list[str]:
     """
     return [
         _decode_str(value=item, path=f"{path}[{index}]")
-        for index, item in enumerate(_decode_list(value=value))
+        for index, item in enumerate(_decode_list(value=value, path=path))
     ]
+
+
+def _validate_result_index(*, value: object) -> int | None:
+    """Validate an optional result index.
+
+    Returns:
+        int | None: The validated index.
+
+    Raises:
+        SchemaError: If ``value`` is not an integer or ``None``.
+    """
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        msg = (
+            "record 'result_index' must be an integer or null, "
+            f"got {type(value).__name__}."
+        )
+        raise SchemaError(msg)
+    return value
 
 
 def _decode_map(*, value: object, path: str) -> Mapping[str, Any]:

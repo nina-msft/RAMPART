@@ -238,6 +238,20 @@ class TestMigrationTolerance:
         assert decoded.population is None
         assert decoded.metadata == {}
 
+    def test_malformed_present_list_fails_closed(self) -> None:
+        data = _minimal_record_dict()
+        data["result"]["turns"] = "not-a-list"
+
+        with pytest.raises(SchemaError, match=r"result\.turns"):
+            deserialize_result(data=data)
+
+    def test_incomplete_population_reference_fails_closed(self) -> None:
+        data = _minimal_record_dict()
+        data["result"]["population"] = {}
+
+        with pytest.raises(SchemaError, match=r"result\.population\.id"):
+            deserialize_result(data=data)
+
 
 class TestValueDomain:
     def test_reserved_metadata_keys_are_stripped(self) -> None:
@@ -278,6 +292,24 @@ class TestValueDomain:
 
         with pytest.raises(SchemaError, match="status"):
             deserialize_result(data=data)
+
+    def test_non_string_harm_category_fails_closed_on_encode(self) -> None:
+        result = _make_full_result()
+        result.__dict__["harm_category"] = 42
+
+        with pytest.raises(SchemaError, match="harm_category"):
+            ResultRecord(result=result).to_dict()
+
+    def test_non_string_harm_category_fails_closed_on_decode(self) -> None:
+        data = _minimal_record_dict()
+        data["result"]["harm_category"] = {"category": "custom"}
+
+        with pytest.raises(SchemaError, match="harm_category"):
+            deserialize_result(data=data)
+
+    def test_boolean_result_index_fails_before_encoding(self) -> None:
+        with pytest.raises(SchemaError, match="result_index"):
+            serialize_result(result=_make_full_result(), result_index=True)
 
 
 class TestBinaryPayloadFailsClosed:
