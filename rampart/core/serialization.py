@@ -54,7 +54,7 @@ TRACE_SCHEMA_VERSION = "rampart.trace.v1"
 # Top-level ``Result.metadata`` keys owned by the xdist transport. These
 # scheduling and bookkeeping values are stripped from the canonical body;
 # nested user maps are never touched.
-RESERVED_METADATA_KEYS: frozenset[str] = frozenset(
+_RESERVED_METADATA_KEYS: frozenset[str] = frozenset(
     {
         "_pytest_nodeid",
         "_pytest_test_name",
@@ -89,23 +89,20 @@ class ResultRecord:
 
     This is the public surface: :meth:`to_dict` / :meth:`from_dict` are the one
     round-trip every durable consumer uses. The ``result`` is referenced, not
-    copied. The collar fields (``identity``, ``pytest_nodeid``, ``result_index``)
-    are wire-only provenance stamped once at the producing boundary.
+    copied. The ``pytest_nodeid`` and ``result_index`` collar fields are
+    wire-only attribution stamped once at the producing boundary.
 
     Args:
         result (Result): The single-run verdict being serialized.
-        identity (dict[str, Any] | None): Stable test identity descriptor.
-            ``None`` until identity is wired at the producer.
         pytest_nodeid (str | None): The pytest node id the result came from.
-        result_index (int): Ordinal of this result within its test node.
+        result_index (int | None): Ordinal of this result within its test node.
     """
 
     VERSION: ClassVar[str] = TRACE_SCHEMA_VERSION
 
     result: Result
-    identity: dict[str, Any] | None = None
     pytest_nodeid: str | None = None
-    result_index: int = 0
+    result_index: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Encode the record into a canonical, JSON-safe dict.
@@ -115,13 +112,15 @@ class ResultRecord:
                 and wire-only collar. Fails closed via :class:`SchemaError` on
                 any value outside the canonical domain.
         """
-        return {
+        encoded = {
             "version": self.VERSION,
             "result": _encode_result(result=self.result, path="result"),
-            "identity": _encode_json(value=self.identity, path="identity"),
-            "pytest_nodeid": self.pytest_nodeid,
-            "result_index": self.result_index,
         }
+        if self.pytest_nodeid is not None:
+            encoded["pytest_nodeid"] = self.pytest_nodeid
+        if self.result_index is not None:
+            encoded["result_index"] = self.result_index
+        return encoded
 
     @classmethod
     def from_dict(cls, data: object) -> ResultRecord:
@@ -151,32 +150,21 @@ class ResultRecord:
 def serialize_result(
     *,
     result: Result,
-    identity: str | None = None,
-    case_id: str | None = None,
     pytest_nodeid: str | None = None,
-    result_index: int = 0,
+    result_index: int | None = None,
 ) -> dict[str, Any]:
     """Serialize a result to the canonical, versioned dict.
 
     Args:
         result (Result): The verdict to serialize.
-        identity (str | None): Stable identity value, if computed.
-        case_id (str | None): Parametrization case id, travelling beside identity.
         pytest_nodeid (str | None): The pytest node id the result came from.
-        result_index (int): Ordinal of this result within its test node.
+        result_index (int | None): Ordinal of this result within its test node.
 
     Returns:
         dict[str, Any]: The canonical record dict, ready for any durable sink.
     """
-    identity_descriptor: dict[str, Any] | None = None
-    if identity is not None or case_id is not None:
-        identity_descriptor = {
-            "value": identity,
-            "case_id": case_id,
-        }
     record = ResultRecord(
         result=result,
-        identity=identity_descriptor,
         pytest_nodeid=pytest_nodeid,
         result_index=result_index,
     )
@@ -204,7 +192,7 @@ def _encode_result(*, result: Result, path: str) -> dict[str, Any]:
     metadata = {
         key: value
         for key, value in result.metadata.items()
-        if key not in RESERVED_METADATA_KEYS
+        if key not in _RESERVED_METADATA_KEYS
     }
     return {
         "status": _encode_enum(value=result.status, path=f"{path}.status"),
@@ -505,14 +493,26 @@ def _decode_v1(data: Mapping[str, Any]) -> ResultRecord:
     if not isinstance(body, Mapping):
         msg = f"record 'result' body must be a mapping, got {type(body).__name__}."
         raise SchemaError(msg)
-    identity = data.get("identity")
-    result_index = data.get("result_index", 0)
+    result_index = data.get("result_index")
     pytest_nodeid = data.get("pytest_nodeid")
+    if pytest_nodeid is not None and not isinstance(pytest_nodeid, str):
+        msg = (
+            "record 'pytest_nodeid' must be a string or null, "
+            f"got {type(pytest_nodeid).__name__}."
+        )
+        raise SchemaError(msg)
+    if result_index is not None and (
+        isinstance(result_index, bool) or not isinstance(result_index, int)
+    ):
+        msg = (
+            "record 'result_index' must be an integer or null, "
+            f"got {type(result_index).__name__}."
+        )
+        raise SchemaError(msg)
     return ResultRecord(
         result=_decode_result(data=body, path="result"),
-        identity=identity if isinstance(identity, Mapping) else None,
-        pytest_nodeid=pytest_nodeid if isinstance(pytest_nodeid, str) else None,
-        result_index=result_index if isinstance(result_index, int) else 0,
+        pytest_nodeid=pytest_nodeid,
+        result_index=result_index,
     )
 
 

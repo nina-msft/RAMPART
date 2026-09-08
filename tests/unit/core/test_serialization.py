@@ -129,26 +129,33 @@ class TestRoundTrip:
         assert encoded["version"] == TRACE_SCHEMA_VERSION
         assert ResultRecord.VERSION == "rampart.trace.v1"
 
-    def test_serialize_result_builds_identity_collar(self) -> None:
+    def test_serialize_result_builds_attribution_collar(self) -> None:
         encoded = serialize_result(
             result=_make_full_result(),
-            identity="auto:mod::test",
-            case_id="case-0",
             pytest_nodeid="tests/test_x.py::test_x",
             result_index=2,
         )
 
-        assert encoded["identity"] == {
-            "value": "auto:mod::test",
-            "case_id": "case-0",
-        }
         assert encoded["pytest_nodeid"] == "tests/test_x.py::test_x"
         assert encoded["result_index"] == 2
 
-    def test_serialize_result_omits_identity_when_unset(self) -> None:
+    def test_serialize_result_omits_attribution_when_unset(self) -> None:
         encoded = serialize_result(result=_make_full_result())
 
-        assert encoded["identity"] is None
+        assert "pytest_nodeid" not in encoded
+        assert "result_index" not in encoded
+
+    def test_attribution_collar_round_trips(self) -> None:
+        encoded = serialize_result(
+            result=_make_full_result(),
+            pytest_nodeid="tests/test_x.py::test_x",
+            result_index=2,
+        )
+
+        decoded = deserialize_result(data=encoded)
+
+        assert decoded.pytest_nodeid == "tests/test_x.py::test_x"
+        assert decoded.result_index == 2
 
     def test_nested_values_survive_the_round_trip(self) -> None:
         decoded = deserialize_result(
