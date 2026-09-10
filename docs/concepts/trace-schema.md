@@ -1,12 +1,38 @@
 # Trace/Result Schema & Migration Policy
 
 `rampart.core.serialization` defines RAMPART's canonical, versioned
-`Result`-record format. The current implementation provides the neutral
-`ResultRecord.to_dict()` / `ResultRecord.from_dict()` round-trip and the
-`serialize_result()` / `deserialize_result()` convenience functions. Existing
+`Result`-record format. `ResultRecord.to_dict()` / `ResultRecord.from_dict()` own
+the versioned envelope and optional `pytest_nodeid` / `result_index` attribution.
+`serialize_result()` / `deserialize_result()` are convenience functions. Existing
 xdist and reporting consumers are not yet wired to this module.
 
 This page defines how the schema may evolve as consumers adopt it.
+
+## Serialization and schema generation
+
+`Result.to_dict()` / `Result.from_dict()` own the **unversioned body**, using one
+cached Pydantic `TypeAdapter` over the existing standard dataclasses. Body dicts
+are fragments, not standalone durable records: persist a `ResultRecord` to
+include the version. `ResultRecord` references the live result; serialization
+does not mutate it.
+
+The adapter validates nested fields without string, boolean, or integer
+coercion. Dictionary input is checked for JSON-only values before strict
+JSON-mode validation reconstructs the dataclasses. Missing fields use their
+declared defaults; explicit `null` is accepted only on nullable fields. Payload
+IDs must be recorded, not generated during deserialization. These boundary
+rules do not replace the normal dataclass constructors used during execution.
+
+`ResultRecord.json_schema()` returns the adapter-derived body schema plus the
+versioned envelope. Small schema customizations describe the trace-only payload
+restrictions and the request invariant (a prompt or at least one attachment).
+`JsonSchemaValue` is the return type, not a separate model or validator.
+The open Draft 2020-12 contract is committed at `schemas/trace.v1.schema.json`.
+
+Regenerate it with `uv run python scripts/generate_trace_schema.py`.
+CI runs the same command with `--check` to detect drift. Changes to generated
+output still require a compatibility review; generation does not decide whether
+a version bump is needed.
 
 ## Versioning
 
@@ -51,15 +77,20 @@ This page defines how the schema may evolve as consumers adopt it.
 
 ## Value domain
 
-- Free-form mappings must already contain JSON-safe values. The canonical codec
-  does not coerce unsupported objects with `str()` or `repr()`.
+- Free-form mappings must already contain JSON-safe values: null, strings,
+  booleans, finite numbers, lists, and string-keyed mappings. Tuples, bytes,
+  cycles, and opaque objects are rejected rather than coerced.
 - Numeric values must be finite. Transport-specific normalization is outside
   the canonical schema.
+- Timestamps retain Python's ISO 8601 representation, including naive datetimes
+  and UTC offsets. The schema describes strings rather than RFC 3339
+  `date-time`, which would exclude some supported Python datetimes.
 - `rampart.trace.v1` does not define a durable representation for binary or
   opaque payload artifacts. Encoding or decoding one fails closed rather than
   coercing it to text.
-- Transport bookkeeping keys are removed from top-level `Result.metadata`;
-  nested user mappings are preserved.
+- `ResultRecord` removes transport bookkeeping keys, including
+  `_rampart_source_worker`, from top-level `Result.metadata`; body serialization
+  does not. Nested user mappings are preserved.
 
 ## Migration mechanics
 

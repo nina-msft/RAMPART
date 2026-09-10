@@ -11,15 +11,35 @@ word the undetermined parts of a summary, which execution strategies share.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
+from pydantic import (
+    ConfigDict,
+    TypeAdapter,
+    ValidationError,
+    with_config,
+)
+from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
+from pydantic_core import PydanticSerializationError, core_schema
+
 from rampart.common.text import safe_str, safe_str_list
+from rampart.core._schema import (
+    JsonMapping,
+    json_value,
+    validation_message,
+)
+from rampart.core.errors import SchemaError
 from rampart.core.types import (
     EvalOutcome,
     EvalResult,
     ObservabilityLevel,
+    Payload,
+    PayloadFormat,
+    Request,
     Turn,
 )
 
@@ -110,6 +130,9 @@ class PopulationRef:
     threshold: float
 
 
+@with_config(
+    ConfigDict(strict=True, revalidate_instances="always", allow_inf_nan=False)
+)
 @dataclass(kw_only=True)
 class Result:
     """The outcome of a safety test.
@@ -157,7 +180,7 @@ class Result:
         default_factory=list[InjectionRecord],
     )
     population: PopulationRef | None = None
-    metadata: dict[str, Any] = field(default_factory=dict[str, Any])
+    metadata: JsonMapping = field(default_factory=dict[str, Any])
 
     @property
     def safe(self) -> bool:
@@ -193,6 +216,97 @@ class Result:
             f"status={self.status.value}, "
             f"summary={self.summary!r})"
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the unversioned body, not a standalone durable record.
+
+        Returns:
+            dict[str, Any]: A JSON-safe body for a ResultRecord envelope.
+
+        Raises:
+            SchemaError: If the result is outside the trace value domain.
+        """
+        adapter = _result_adapter()
+        try:
+            validated = adapter.validate_python(self, context={"trace": True})
+            return adapter.dump_python(validated, mode="json", warnings="error")
+        except ValidationError as exc:
+            raise SchemaError(validation_message(error=exc, path="result")) from exc
+        except (PydanticSerializationError, RecursionError) as exc:
+            msg = f"result: cannot serialize canonical body ({type(exc).__name__})"
+            raise SchemaError(msg) from exc
+
+    @classmethod
+    def from_dict(cls, data: object) -> Result:
+        """Validate and reconstruct an unversioned canonical body.
+
+        Args:
+            data (object): A JSON-compatible body from a versioned record.
+
+        Returns:
+            Result: The reconstructed result.
+
+        Raises:
+            SchemaError: If the body is malformed or outside the trace domain.
+        """
+        try:
+            # JSON-mode strict validation accepts wire enums/dates, not coercions.
+            encoded = json.dumps(json_value(data), allow_nan=False)
+            return _result_adapter().validate_json(encoded, context={"trace": True})
+        except ValidationError as exc:
+            raise SchemaError(validation_message(error=exc, path="result")) from exc
+        except (ValueError, RecursionError) as exc:
+            msg = f"result: {exc}"
+            raise SchemaError(msg) from exc
+
+    @classmethod
+    def json_schema(cls) -> JsonSchemaValue:
+        """Generate the body contract from the configured dataclass adapter.
+
+        Returns:
+            JsonSchemaValue: The JSON Schema for the unversioned body.
+        """
+        return _result_adapter().json_schema(schema_generator=_ResultJsonSchema)
+
+
+@cache
+def _result_adapter() -> TypeAdapter[Result]:
+    """Build the recursive adapter once, on first serialization use.
+
+    Returns:
+        TypeAdapter[Result]: The cached adapter.
+    """
+    return TypeAdapter(Result)
+
+
+class _ResultJsonSchema(GenerateJsonSchema):
+    """Describe trace-only restrictions alongside the dataclass field schemas."""
+
+    def dataclass_schema(self, schema: core_schema.DataclassSchema) -> JsonSchemaValue:
+        """Add trace policies that do not restrict live dataclass construction.
+
+        Returns:
+            JsonSchemaValue: An open object schema matching the trace validators.
+        """
+        result = super().dataclass_schema(schema)
+        result["additionalProperties"] = True
+        if schema["cls"] is Payload:
+            result["properties"]["format"] = {
+                "type": "string",
+                "enum": [value.value for value in PayloadFormat if value.is_text],
+                "default": PayloadFormat.TEXT.value,
+            }
+            result["properties"]["artifact"] = {"type": "null", "default": None}
+            result["required"] = [*result["required"], "id"]
+        elif schema["cls"] is Request:
+            result["anyOf"] = [
+                {"required": ["prompt"], "properties": {"prompt": {"type": "string"}}},
+                {
+                    "required": ["attachments"],
+                    "properties": {"attachments": {"type": "array", "minItems": 1}},
+                },
+            ]
+        return result
 
 
 @dataclass(kw_only=True)
