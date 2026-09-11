@@ -122,6 +122,18 @@ does not make currently rejected formats readable by older readers.
   or changing its meaning or nesting, bumps `vN → vN+1` with a changelog and a
   migration note.
 
+```mermaid
+flowchart TD
+    change([proposed schema change]) --> q1{"adds a field only?"}
+    q1 -- no --> struct["structural:<br/>remove / rename / retype /<br/>change meaning or nesting"]
+    q1 -- yes --> q2{"optional with a<br/>well-defined default?"}
+    q2 -- no --> struct
+    q2 -- yes --> add["additive-optional"]
+    add --> nobump["NO bump<br/>(new optional fields)<br/>old readers ignore unknown keys"]
+    struct --> bump["bump major vN → vN+1<br/>+ changelog + migration note"]
+    bump --> reader["readers: fail closed on<br/>unknown major"]
+```
+
 ## Reader posture
 
 - Readers tolerate unknown fields and **fail closed on an unknown major** — a
@@ -188,15 +200,3 @@ Starting with the first release that writes durable trace records by default,
 RAMPART supports reading `vN` and `vN-1` for **two subsequent framework
 releases** (one deprecation cycle). The window is keyed on releases, not time.
 Any major bump includes a changelog entry and migration note.
-
-```mermaid
-flowchart TD
-    change([proposed schema change]) --> q1{"adds a field only?"}
-    q1 -- no --> struct["structural:<br/>remove / rename / retype /<br/>change meaning or nesting"]
-    q1 -- yes --> q2{"optional with a<br/>well-defined default?"}
-    q2 -- no --> struct
-    q2 -- yes --> add["additive-optional"]
-    add --> nobump["NO bump<br/>(new optional fields)<br/>old readers ignore unknown keys"]
-    struct --> bump["bump major vN → vN+1<br/>+ changelog + migration note"]
-    bump --> reader["readers: fail closed on<br/>unknown major"]
-```
