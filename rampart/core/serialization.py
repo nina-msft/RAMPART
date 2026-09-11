@@ -14,6 +14,7 @@ from typing import (
     ClassVar,
 )
 
+from rampart.core._schema import json_string
 from rampart.core.errors import SchemaError, UnsupportedSchemaVersionError
 from rampart.core.result import Result
 
@@ -68,6 +69,11 @@ class ResultRecord:
         if self.pytest_nodeid is not None and not isinstance(self.pytest_nodeid, str):
             msg = "record.pytest_nodeid: expected a string or null"
             raise SchemaError(msg)
+        if self.pytest_nodeid is not None:
+            try:
+                json_string(value=self.pytest_nodeid, path="record.pytest_nodeid")
+            except ValueError as exc:
+                raise SchemaError(str(exc)) from exc
         if self.result_index is not None and type(self.result_index) is not int:
             msg = "record.result_index: expected an integer or null"
             raise SchemaError(msg)
@@ -135,6 +141,7 @@ class ResultRecord:
             "description": (
                 "Structural trace contract. The record decoder additionally "
                 "requires parseable Python ISO datetimes, finite numbers, "
+                "Unicode scalar strings, "
                 "and integer fields without floating-point notation."
             ),
             "type": "object",

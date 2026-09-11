@@ -37,6 +37,12 @@ declared defaults; explicit `null` is accepted only on nullable fields. Payload
 IDs must be recorded, not generated during deserialization. These boundary
 rules do not replace the normal dataclass constructors used during execution.
 
+Body encoding uses adapter-local enum and datetime serializers in Python mode,
+then validates the output through the canonical reader before returning it.
+This extra validation pass aligns writer and reader nesting support without
+introducing a new depth cap or inheriting Pydantic's lower JSON-mode writer limit.
+Interpreter and parser recursion limits still apply; failures raise `SchemaError`.
+
 These policies belong to the cached canonical adapter, not to the public
 dataclass annotations or configuration. Fields remain `dict[str, Any]` and
 `datetime | None`. Independently constructed Pydantic adapters retain their
@@ -71,6 +77,9 @@ The decoder additionally enforces these representation rules:
   naive datetimes and subminute UTC offsets.
 - Numbers must be finite and representable by the corresponding Python field.
   For example, an overflowing JSON exponent cannot become an infinite float.
+- Strings and mapping keys must contain Unicode scalar values. Surrogate code
+  points in Python strings are rejected, not replaced or combined. Valid JSON
+  surrogate-pair escapes for characters such as emoji remain supported.
 
 External producers should emit integer notation for integer fields, supported
 ISO datetime strings, and finite numbers, then exercise the canonical reader
@@ -165,6 +174,9 @@ flowchart TD
   cycles, and opaque objects are rejected rather than coerced.
 - Numeric values must be finite. Transport-specific normalization is outside
   the canonical schema.
+- Strings and mapping keys must contain Unicode scalar values, including optional
+  attribution. Encoding rejects surrogate-containing strings before returning
+  a body or record; decoding rejects them in dictionary input as well.
 - Timestamps retain Python's ISO 8601 representation, including naive datetimes
   and UTC offsets. The schema describes strings rather than RFC 3339
   `date-time`, which would exclude some supported Python datetimes.

@@ -29,7 +29,6 @@ from pydantic import (
     ValidationError,
 )
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
-from pydantic_core import PydanticSerializationError, core_schema
 
 from rampart.common.text import safe_str, safe_str_list
 from rampart.core._schema import (
@@ -52,6 +51,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from pydantic.json_schema import JsonSchemaMode
+    from pydantic_core import core_schema
 
 
 class SafetyStatus(Enum):
@@ -233,12 +233,15 @@ class Result:
         adapter = _result_adapter()
         try:
             validated = adapter.validate_python(self, strict=True)
-            return adapter.dump_python(validated, mode="json", warnings="error")
+            # JSON-mode dumping has a lower nesting limit than the reader.
+            body = adapter.dump_python(validated, mode="python", warnings="error")
+            Result.from_dict(body)
         except ValidationError as exc:
             raise SchemaError(validation_message(error=exc, path="result")) from exc
-        except (PydanticSerializationError, RecursionError) as exc:
+        except (ValueError, RecursionError) as exc:
             msg = f"result: cannot serialize canonical body ({type(exc).__name__})"
             raise SchemaError(msg) from exc
+        return body
 
     @classmethod
     def from_dict(cls, data: object) -> Result:

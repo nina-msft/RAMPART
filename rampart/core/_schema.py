@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from datetime import datetime
+from operator import attrgetter
 from typing import TYPE_CHECKING
 
 from pydantic_core import core_schema
@@ -89,6 +90,20 @@ def _trace_schema(
         ]
     elif schema["type"] == "dict":
         return core_schema.no_info_before_validator_function(json_value, schema)
+
+    return _trace_scalar(schema)
+
+
+def _trace_scalar(schema: core_schema.CoreSchema) -> core_schema.CoreSchema:
+    """Apply wire representations to copied enum and datetime schema nodes.
+
+    Returns:
+        CoreSchema: The schema with scalar serialization policies applied.
+    """
+    if schema["type"] == "enum":
+        schema["serialization"] = core_schema.plain_serializer_function_ser_schema(
+            attrgetter("value")
+        )
     elif schema["type"] == "datetime":
         return core_schema.with_info_before_validator_function(
             _iso_datetime,
@@ -162,6 +177,23 @@ def _trace_payload(value: object) -> object:
     return value
 
 
+def json_string(*, value: str, path: str) -> str:
+    """Require Unicode scalar values without altering the string.
+
+    Returns:
+        str: The unchanged string.
+
+    Raises:
+        ValueError: If the string contains surrogate code points.
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        msg = f"{path}: surrogate code points are not supported in strings"
+        raise ValueError(msg) from exc
+    return value
+
+
 def json_value(value: object) -> object:
     """Check and copy JSON values without lossy coercion.
 
@@ -183,7 +215,9 @@ def _json_value(*, value: object, path: str, active: set[int]) -> object:
     Raises:
         ValueError: If the value cannot be represented faithfully in JSON.
     """
-    if value is None or isinstance(value, str | bool | int):
+    if isinstance(value, str):
+        return json_string(value=value, path=path)
+    if value is None or isinstance(value, bool | int):
         return value
     if isinstance(value, float) and math.isfinite(value):
         return value
@@ -205,6 +239,7 @@ def _json_value(*, value: object, path: str, active: set[int]) -> object:
             if not isinstance(key, str):
                 msg = f"{path}: JSON object keys must be strings"
                 raise ValueError(msg)  # ruff: ignore[type-check-without-type-error] Pydantic wraps ValueError.
+            json_string(value=key, path=f"{path}.<key>")
             result[key] = _json_value(value=item, path=f"{path}.{key}", active=active)
         return result
     finally:

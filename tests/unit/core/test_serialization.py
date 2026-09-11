@@ -153,6 +153,13 @@ def _freeform_maps(result: Result) -> list[MutableMapping[str, Any]]:
     ]
 
 
+def _nested_json_value(*, depth: int, mapping: bool) -> object:
+    value: object = "leaf"
+    for _ in range(depth):
+        value = {"nested": value} if mapping else [value]
+    return value
+
+
 class TestRoundTrip:
     def test_full_result_round_trips_to_equal_value(self) -> None:
         original = ResultRecord(result=_make_full_result())
@@ -279,6 +286,79 @@ class TestJsonTextBoundary:
 
         with pytest.raises(SchemaError, match="metadata"):
             serialize_record(record=record)
+
+
+class TestUnicodeDomain:
+    _INVALID_TEXT = (
+        pytest.param(chr(0xD800), id="high-surrogate"),
+        pytest.param(chr(0xDFFF), id="low-surrogate"),
+        pytest.param(chr(0xD83D) + chr(0xDE00), id="surrogate-pair"),
+    )
+
+    @pytest.mark.parametrize("text", _INVALID_TEXT)
+    @pytest.mark.parametrize("nested", [False, True])
+    def test_surrogates_in_typed_text_are_rejected(
+        self, *, text: str, nested: bool
+    ) -> None:
+        result = _make_full_result()
+        body = result.to_dict()
+        field = "text" if nested else "summary"
+        target = result.turns[0].response if nested else result
+        body_target = body["turns"][0]["response"] if nested else body
+        setattr(target, field, text)
+        body_target[field] = text
+
+        with pytest.raises(SchemaError, match=rf"{field}.*surrogate"):
+            result.to_dict()
+        with pytest.raises(SchemaError, match=rf"{field}.*surrogate"):
+            Result.from_dict(body)
+        with pytest.raises(SchemaError, match=rf"{field}.*surrogate"):
+            serialize_record(record=ResultRecord(result=result))
+
+    @pytest.mark.parametrize("text", _INVALID_TEXT)
+    @pytest.mark.parametrize("map_index", range(5))
+    @pytest.mark.parametrize("as_key", [False, True])
+    def test_surrogates_in_freeform_keys_and_values_are_rejected(
+        self, *, text: str, map_index: int, as_key: bool
+    ) -> None:
+        result = _make_full_result()
+        _freeform_maps(result)[map_index]["nested"] = (
+            {text: "value"} if as_key else {"text": text}
+        )
+
+        with pytest.raises(SchemaError, match=r"nested.*surrogate") as error:
+            result.to_dict()
+
+        assert text not in str(error.value)
+
+    @pytest.mark.parametrize("text", _INVALID_TEXT)
+    def test_surrogate_attribution_is_rejected(self, text: str) -> None:
+        data = _minimal_record_dict()
+        data["pytest_nodeid"] = text
+
+        with pytest.raises(SchemaError, match=r"record\.pytest_nodeid.*surrogate"):
+            ResultRecord(result=_make_full_result(), pytest_nodeid=text)
+        with pytest.raises(SchemaError, match=r"record\.pytest_nodeid.*surrogate"):
+            ResultRecord.from_dict(data)
+
+    @pytest.mark.parametrize("text", _INVALID_TEXT[:2])
+    def test_unpaired_json_surrogate_escapes_are_rejected(self, text: str) -> None:
+        data = _minimal_record_dict()
+        data["result"]["summary"] = text
+
+        with pytest.raises(SchemaError, match=r"summary.*surrogate"):
+            deserialize_record(data=json.dumps(data))
+
+    def test_unicode_scalars_and_valid_json_surrogate_pairs_round_trip(self) -> None:
+        text = "\u00e9\U0001f600"
+        result = _make_full_result(metadata={text: text})
+        result.summary = text
+        record = ResultRecord(result=result, pytest_nodeid=text)
+
+        encoded = serialize_record(record=record)
+
+        assert r"\ud83d\ude00" in encoded
+        assert deserialize_record(data=encoded) == record
 
 
 class TestFieldExhaustiveness:
@@ -813,6 +893,67 @@ class TestJsonValueDomain:
         assert result.metadata == metadata
         assert metadata["nested"]["list"][0]["text"] == "hello"
         assert restored.metadata["values"] == metadata["values"]
+
+
+class TestJsonNesting:
+    @pytest.mark.parametrize("depth", [100, 180])
+    @pytest.mark.parametrize("mapping", [False, True])
+    @pytest.mark.parametrize("map_index", range(5))
+    def test_deep_supported_values_round_trip(
+        self, *, depth: int, mapping: bool, map_index: int
+    ) -> None:
+        result = _make_full_result()
+        _freeform_maps(result)[map_index]["deep"] = _nested_json_value(
+            depth=depth, mapping=mapping
+        )
+        record = ResultRecord(result=result)
+
+        body = result.to_dict()
+        encoded = serialize_record(record=record)
+        restored = deserialize_record(data=encoded)
+
+        assert Result.from_dict(body) == result
+        assert restored == record
+        assert serialize_record(record=restored) == encoded
+
+    def test_deep_external_record_can_be_reencoded(self) -> None:
+        data = _minimal_record_dict()
+        data["result"]["metadata"] = {
+            "deep": _nested_json_value(depth=100, mapping=False)
+        }
+
+        record = deserialize_record(data=json.dumps(data))
+        encoded = serialize_record(record=record)
+
+        assert json.loads(encoded)["result"]["metadata"] == data["result"]["metadata"]
+
+    @pytest.mark.parametrize("mapping", [False, True])
+    def test_parser_depth_failures_raise_schema_error_on_both_boundaries(
+        self, *, mapping: bool
+    ) -> None:
+        value = _nested_json_value(depth=250, mapping=mapping)
+        result = _make_full_result(metadata={"deep": value})
+        data = _minimal_record_dict()
+        data["result"]["metadata"] = result.metadata
+
+        with pytest.raises(SchemaError, match=r"recursion|depth"):
+            result.to_dict()
+        with pytest.raises(SchemaError, match=r"recursion|depth"):
+            ResultRecord.from_dict(data)
+        with pytest.raises(SchemaError, match=r"recursion|depth"):
+            serialize_record(record=ResultRecord(result=result))
+        with pytest.raises(SchemaError, match=r"recursion|depth"):
+            deserialize_record(data=json.dumps(data))
+
+    def test_adapter_serialization_value_error_is_wrapped(self) -> None:
+        original_error = ValueError("Circular reference detected (depth exceeded)")
+        with (
+            patch.object(_result_adapter(), "dump_python", side_effect=original_error),
+            pytest.raises(SchemaError, match=r"cannot serialize.*ValueError") as error,
+        ):
+            _make_full_result().to_dict()
+
+        assert error.value.__cause__ is original_error
 
 
 class TestGeneratedSchema:

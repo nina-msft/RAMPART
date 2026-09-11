@@ -373,7 +373,7 @@
   "$id": "urn:rampart:trace:v1",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": true,
-  "description": "Structural trace contract. The record decoder additionally requires parseable Python ISO datetimes, finite numbers, and integer fields without floating-point notation.",
+  "description": "Structural trace contract. The record decoder additionally requires parseable Python ISO datetimes, finite numbers, Unicode scalar strings, and integer fields without floating-point notation.",
   "properties": {
     "pytest_nodeid": {
       "type": [
