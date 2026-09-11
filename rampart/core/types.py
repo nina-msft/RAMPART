@@ -10,24 +10,15 @@ evaluators, adapters, factories, and reporting all speak in these types.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import (
+    datetime,  # ruff: ignore[typing-only-standard-library-import] Resolved by TypeAdapter.
+)
 from enum import Enum
 from pathlib import (
     Path,  # ruff: ignore[typing-only-standard-library-import] Resolved by TypeAdapter.
 )
 from typing import TYPE_CHECKING, Any
-
-from pydantic import (
-    ValidationInfo,
-    field_validator,
-    model_validator,
-)
-
-from rampart.core._schema import (
-    IsoDatetime,  # ruff: ignore[typing-only-first-party-import] Resolved by TypeAdapter.
-    JsonMapping,  # ruff: ignore[typing-only-first-party-import] Resolved by TypeAdapter.
-)
 
 if TYPE_CHECKING:
     from rampart.core.manifest import AppManifest
@@ -151,63 +142,7 @@ class Payload:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     format: PayloadFormat = PayloadFormat.TEXT
     artifact: Path | None = None
-    metadata: JsonMapping = field(default_factory=dict[str, Any])
-
-    # Pydantic invokes validator callbacks with positional value/info arguments.
-    @model_validator(mode="before")
-    @classmethod
-    def _validate_trace_id(cls, value: object, info: ValidationInfo) -> object:
-        """Require recorded payload identity instead of generating one on read.
-
-        Returns:
-            object: The unchanged input.
-
-        Raises:
-            ValueError: If a trace payload has no recorded id.
-        """
-        if (
-            info.context
-            and info.context.get("trace")
-            and isinstance(value, Mapping)
-            and "id" not in value
-        ):
-            msg = "id: a trace payload must record its id"
-            raise ValueError(msg)
-        return value
-
-    @field_validator("format")
-    @classmethod
-    def _validate_trace_format(
-        cls, value: PayloadFormat, info: ValidationInfo
-    ) -> PayloadFormat:
-        """Reject binary formats at the trace boundary, not during live use.
-
-        Returns:
-            PayloadFormat: The validated format.
-
-        Raises:
-            ValueError: If a trace contains a binary payload.
-        """
-        if info.context and info.context.get("trace") and value.is_binary:
-            msg = f"binary payload format {value.value!r} is unsupported in traces"
-            raise ValueError(msg)
-        return value
-
-    @field_validator("artifact", mode="before")
-    @classmethod
-    def _validate_trace_artifact(cls, value: object, info: ValidationInfo) -> object:
-        """Reject trace artifacts before path construction or filesystem access.
-
-        Returns:
-            object: The unchanged artifact for live use, or None for a trace.
-
-        Raises:
-            ValueError: If a trace contains a non-null artifact.
-        """
-        if info.context and info.context.get("trace") and value is not None:
-            msg = "artifact: only null is supported in traces"
-            raise ValueError(msg)
-        return value
+    metadata: dict[str, Any] = field(default_factory=dict[str, Any])
 
     def __post_init__(self) -> None:
         """Validate content-format-artifact consistency.
@@ -263,9 +198,9 @@ class ToolCall:
     """
 
     name: str
-    arguments: JsonMapping = field(default_factory=dict[str, Any])
+    arguments: dict[str, Any] = field(default_factory=dict[str, Any])
     result: str | None = None
-    timestamp: IsoDatetime | None = None
+    timestamp: datetime | None = None
 
 
 @dataclass(kw_only=True)
@@ -282,7 +217,7 @@ class SideEffect:
     """
 
     kind: str
-    details: JsonMapping = field(default_factory=dict[str, Any])
+    details: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass(kw_only=True)
@@ -301,7 +236,7 @@ class Response:
     text: str
     tool_calls: list[ToolCall] = field(default_factory=list[ToolCall])
     side_effects: list[SideEffect] = field(default_factory=list[SideEffect])
-    metadata: JsonMapping = field(default_factory=dict[str, Any])
+    metadata: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
 @dataclass(kw_only=True)
@@ -353,7 +288,7 @@ class Turn:
     response: Response
     eval_result: EvalResult | None = None
     turn_number: int = 0
-    timestamp: IsoDatetime | None = None
+    timestamp: datetime | None = None
     driver_reasoning: str = ""
 
 

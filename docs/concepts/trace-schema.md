@@ -37,6 +37,11 @@ declared defaults; explicit `null` is accepted only on nullable fields. Payload
 IDs must be recorded, not generated during deserialization. These boundary
 rules do not replace the normal dataclass constructors used during execution.
 
+These policies belong to the cached canonical adapter, not to the public
+dataclass annotations or configuration. Fields remain `dict[str, Any]` and
+`datetime | None`. Independently constructed Pydantic adapters retain their
+normal behavior, including live binary payload support.
+
 `ResultRecord.json_schema()` returns the adapter-derived body schema plus the
 versioned envelope. Small schema customizations describe the trace-only payload
 restrictions and the request invariant (a prompt or at least one attachment).
@@ -47,6 +52,50 @@ Regenerate it with `uv run python scripts/generate_trace_schema.py`.
 CI runs the same command with `--check` to detect drift. Changes to generated
 output still require a compatibility review; generation does not decide whether
 a version bump is needed.
+
+### Structural schema and decoder semantics
+
+The JSON Schema checks structure; passing it is necessary but **not sufficient**
+for successful record decoding. Use `deserialize_record()` (or
+`ResultRecord.from_dict()` for dictionaries) for the complete contract.
+
+The decoder additionally enforces these representation rules:
+
+- Integer fields use integer notation, not floating-point notation. JSON Schema
+  accepts `0.0` as an integer mathematically; the strict decoder rejects it for
+  fields such as `result_index`, `turn_number`, and population `index` / `size`.
+- Timestamp strings must parse with Python's `datetime.fromisoformat()`. The
+  schema intentionally does not claim RFC 3339 validation, since Python supports
+  naive datetimes and subminute UTC offsets.
+- Numbers must be finite and representable by the corresponding Python field.
+  For example, an overflowing JSON exponent cannot become an infinite float.
+
+External producers should emit integer notation for integer fields, supported
+ISO datetime strings, and finite numbers, then exercise the canonical reader
+as well as structural schema validation. These are decoder requirements, not
+additional serializers.
+
+## Transport compatibility boundary
+
+The canonical codec preserves supported values; it does not provide a lenient
+transport mode. Existing transports and flat reports can accept data outside
+that domain, so adopting the codec is not a direct replacement of their current
+serialization calls.
+
+Transport normalization must happen **before** canonical encoding when the live
+result contains unsupported values. Prepare a separate result without mutating
+the original, then use the same record codec. Caps, rendering sanitization,
+worker bookkeeping, and explicit loss/truncation markers remain transport
+responsibilities. None belongs in a second field-by-field result serializer.
+
+A text placeholder prepared from a binary payload is a lossy transport view,
+not a durable copy of that payload. Original format/path information must remain
+available for transport diagnostics, and the containing transport must identify
+the loss. Do not persist that view as a full-fidelity replay artifact. The
+canonical reader itself never performs this conversion or opens a worker path.
+Supporting durable binary artifacts requires a separately designed
+representation and compatibility review; reserving an `artifacts` field alone
+does not make currently rejected formats readable by older readers.
 
 ## Versioning
 

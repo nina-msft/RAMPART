@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import (
     UTC,
     datetime,
@@ -16,7 +16,11 @@ from datetime import (
     timezone,
 )
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    get_type_hints,
+)
 from unittest.mock import patch
 
 import pytest
@@ -592,6 +596,137 @@ class TestResultAdapter:
             Result.from_dict(body)
 
 
+class TestAdapterIsolation:
+    def test_public_annotations_remain_standard_types(self) -> None:
+        for cls, name in [
+            (Result, "metadata"),
+            (Payload, "metadata"),
+            (Response, "metadata"),
+            (ToolCall, "arguments"),
+            (SideEffect, "details"),
+        ]:
+            assert get_type_hints(cls, include_extras=True)[name] == dict[str, Any]
+        for cls in [ToolCall, Turn]:
+            assert get_type_hints(cls, include_extras=True)["timestamp"] == (
+                datetime | None
+            )
+        assert not hasattr(Result, "__pydantic_config__")
+
+    def test_regular_adapters_are_unchanged_before_and_after_canonical_use(
+        self,
+    ) -> None:
+        adapter = TypeAdapter(Result)
+        original_schema = adapter.json_schema()
+        result = _make_full_result(metadata={"tuple": (1, 2), "opaque": object()})
+
+        with pytest.raises(SchemaError, match="metadata"):
+            result.to_dict()
+        Result.json_schema()
+
+        assert adapter.validate_python(result) is result
+        assert TypeAdapter(Result).validate_python(result) is result
+        assert adapter.json_schema() == original_schema
+        assert TypeAdapter(Result).json_schema() == original_schema
+
+    def test_regular_adapter_can_still_generate_payload_ids(self) -> None:
+        _make_full_result().to_dict()
+
+        payload = TypeAdapter(Payload).validate_python(
+            {"content": "live", "metadata": {"tuple": (1, 2)}}
+        )
+
+        assert payload.id
+        assert payload.metadata["tuple"] == (1, 2)
+
+    def test_regular_adapter_retains_pydantic_datetime_behavior(self) -> None:
+        result = _make_full_result()
+
+        canonical = result.to_dict()
+        regular = TypeAdapter(Result).dump_python(result, mode="json")
+
+        assert canonical["turns"][0]["timestamp"].endswith("+00:00")
+        assert regular["turns"][0]["timestamp"].endswith("Z")
+
+    def test_regular_adapter_can_decode_live_binary_payloads(
+        self, tmp_path: Path
+    ) -> None:
+        artifact = tmp_path / "document.pdf"
+        artifact.write_bytes(b"%PDF-1.4 fake")
+        _make_full_result().to_dict()
+
+        payload = TypeAdapter(Payload).validate_python(
+            {"content": "doc", "format": "pdf", "artifact": str(artifact)}
+        )
+
+        assert payload.format is PayloadFormat.PDF
+        assert payload.artifact == artifact
+
+    def test_reused_nested_schemas_still_validate_all_instances(self) -> None:
+        result = _make_full_result()
+        result.turns.append(_make_turn())
+        result.turns[1].request.attachments[0].metadata["bad"] = (1, 2)
+
+        with pytest.raises(SchemaError, match=r"turns\[1\].*metadata"):
+            result.to_dict()
+
+    def test_nested_numeric_fields_are_still_finite(self) -> None:
+        result = _make_full_result()
+        assert result.turns[0].eval_result is not None
+        result.turns[0].eval_result.confidence = math.inf
+
+        with pytest.raises(SchemaError, match="confidence"):
+            result.to_dict()
+
+
+class TestTransportPreparationBoundary:
+    def test_prepared_copy_does_not_relax_the_original_record(
+        self, tmp_path: Path
+    ) -> None:
+        artifact = tmp_path / "worker.pdf"
+        artifact.write_bytes(b"%PDF-1.4 fake")
+        original = _make_full_result(metadata={"tuple": (1, 2)})
+        binary = Payload(
+            content="document text", format=PayloadFormat.PDF, artifact=artifact
+        )
+        original.turns[0].request.attachments = [binary]
+        with pytest.raises(SchemaError):
+            serialize_record(record=ResultRecord(result=original))
+
+        display_payload = replace(
+            binary,
+            format=PayloadFormat.TEXT,
+            artifact=None,
+            metadata={
+                "_rampart_worker_format": "pdf",
+                "_rampart_worker_artifact_path": str(artifact),
+            },
+        )
+        prepared = replace(
+            original,
+            metadata={"tuple": [1, 2]},
+            turns=[
+                replace(
+                    original.turns[0],
+                    request=replace(
+                        original.turns[0].request, attachments=[display_payload]
+                    ),
+                )
+            ],
+        )
+
+        restored = deserialize_record(
+            data=serialize_record(record=ResultRecord(result=prepared))
+        ).result
+
+        assert restored == prepared
+        assert original.metadata["tuple"] == (1, 2)
+        assert original.turns[0].request.attachments[0] is binary
+        assert binary.format is PayloadFormat.PDF
+        assert binary.artifact == artifact
+        with pytest.raises(SchemaError):
+            serialize_record(record=ResultRecord(result=original))
+
+
 class TestJsonValueDomain:
     @pytest.mark.parametrize("map_index", range(5))
     @pytest.mark.parametrize(
@@ -656,14 +791,45 @@ class TestJsonValueDomain:
 
 
 class TestGeneratedSchema:
-    def test_generated_schema_is_valid_and_matches_checked_in_contract(self) -> None:
+    def test_generated_schema_is_valid(self) -> None:
         schema = ResultRecord.json_schema()
-        path = Path(__file__).resolve().parents[3] / "schemas" / "trace.v1.schema.json"
 
         Draft202012Validator.check_schema(schema)
 
-        assert json.loads(path.read_text(encoding="utf-8")) == schema
         assert schema["properties"]["version"]["const"] == TRACE_SCHEMA_VERSION
+
+    def test_schema_omits_runtime_class_documentation(self) -> None:
+        schema = ResultRecord.json_schema()
+
+        assert "description" not in schema["properties"]["result"]
+        assert "description" not in schema["$defs"]["SafetyStatus"]
+        assert "not supported" in schema["$defs"]["Payload"]["description"]
+        assert "Args:" not in json.dumps(schema)
+
+    @pytest.mark.parametrize(
+        ("path", "value"),
+        [
+            (("result_index",), 0.0),
+            (("result", "population", "index"), 0.0),
+            (("result", "turns", 0, "timestamp"), "not-a-date"),
+        ],
+    )
+    def test_structural_validation_does_not_replace_decoder_semantics(
+        self, *, path: tuple[str | int, ...], value: object
+    ) -> None:
+        data = ResultRecord(result=_make_full_result()).to_dict()
+        parent: Any = data
+        for key in path[:-1]:
+            parent = parent[key]
+        parent[path[-1]] = value
+        validator = Draft202012Validator(
+            ResultRecord.json_schema(),
+            format_checker=Draft202012Validator.FORMAT_CHECKER,
+        )
+
+        validator.validate(data)
+        with pytest.raises(SchemaError, match=re.escape(str(path[-1]))):
+            deserialize_record(data=json.dumps(data))
 
     @pytest.mark.parametrize("payload_format", list(PayloadFormat))
     def test_schema_and_decoder_agree_on_payload_formats(

@@ -15,21 +15,24 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from functools import cache
-from typing import TYPE_CHECKING, Any
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+)
 
 from pydantic import (
-    ConfigDict,
+    GetPydanticSchema,
     TypeAdapter,
     ValidationError,
-    with_config,
 )
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from pydantic_core import PydanticSerializationError, core_schema
 
 from rampart.common.text import safe_str, safe_str_list
 from rampart.core._schema import (
-    JsonMapping,
     json_value,
+    trace_schema,
     validation_message,
 )
 from rampart.core.errors import SchemaError
@@ -45,6 +48,8 @@ from rampart.core.types import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from pydantic.json_schema import JsonSchemaMode
 
 
 class SafetyStatus(Enum):
@@ -130,9 +135,6 @@ class PopulationRef:
     threshold: float
 
 
-@with_config(
-    ConfigDict(strict=True, revalidate_instances="always", allow_inf_nan=False)
-)
 @dataclass(kw_only=True)
 class Result:
     """The outcome of a safety test.
@@ -180,7 +182,7 @@ class Result:
         default_factory=list[InjectionRecord],
     )
     population: PopulationRef | None = None
-    metadata: JsonMapping = field(default_factory=dict[str, Any])
+    metadata: dict[str, Any] = field(default_factory=dict[str, Any])
 
     @property
     def safe(self) -> bool:
@@ -228,7 +230,7 @@ class Result:
         """
         adapter = _result_adapter()
         try:
-            validated = adapter.validate_python(self, context={"trace": True})
+            validated = adapter.validate_python(self, strict=True)
             return adapter.dump_python(validated, mode="json", warnings="error")
         except ValidationError as exc:
             raise SchemaError(validation_message(error=exc, path="result")) from exc
@@ -252,7 +254,7 @@ class Result:
         try:
             # JSON-mode strict validation accepts wire enums/dates, not coercions.
             encoded = json.dumps(json_value(data), allow_nan=False)
-            return _result_adapter().validate_json(encoded, context={"trace": True})
+            return _result_adapter().validate_json(encoded, strict=True)
         except ValidationError as exc:
             raise SchemaError(validation_message(error=exc, path="result")) from exc
         except (ValueError, RecursionError) as exc:
@@ -276,11 +278,31 @@ def _result_adapter() -> TypeAdapter[Result]:
     Returns:
         TypeAdapter[Result]: The cached adapter.
     """
-    return TypeAdapter(Result)
+    return TypeAdapter(Annotated[Result, GetPydanticSchema(trace_schema)])
 
 
 class _ResultJsonSchema(GenerateJsonSchema):
     """Describe trace-only restrictions alongside the dataclass field schemas."""
+
+    def generate(
+        self, schema: core_schema.CoreSchema, mode: JsonSchemaMode = "validation"
+    ) -> JsonSchemaValue:
+        """Omit runtime class documentation from the published wire contract.
+
+        Returns:
+            JsonSchemaValue: A schema with only trace-specific descriptions.
+        """
+        result = super().generate(schema, mode=mode)
+        result.pop("description", None)
+        definitions = result.get("$defs", {})
+        for definition in definitions.values():
+            definition.pop("description", None)
+        if "Payload" in definitions:
+            definitions["Payload"]["description"] = (
+                "Recorded text payload. Binary formats and file artifacts "
+                "are not supported by this trace schema."
+            )
+        return result
 
     def dataclass_schema(self, schema: core_schema.DataclassSchema) -> JsonSchemaValue:
         """Add trace policies that do not restrict live dataclass construction.
@@ -306,6 +328,20 @@ class _ResultJsonSchema(GenerateJsonSchema):
                     "properties": {"attachments": {"type": "array", "minItems": 1}},
                 },
             ]
+        return result
+
+    def datetime_schema(self, schema: core_schema.DatetimeSchema) -> JsonSchemaValue:
+        """Describe Python datetimes without claiming RFC 3339 validation.
+
+        Returns:
+            JsonSchemaValue: A string with decoder-enforced datetime semantics.
+        """
+        result = super().datetime_schema(schema)
+        result.pop("format", None)
+        result["description"] = (
+            "Python ISO 8601 datetime; UTC offset is optional. "
+            "Parseability is enforced by the record decoder, not this schema."
+        )
         return result
 
 

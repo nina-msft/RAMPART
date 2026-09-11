@@ -132,6 +132,11 @@ class ResultRecord:
             "$id": f"urn:rampart:trace:{TRACE_SCHEMA_VERSION.rsplit('.', 1)[-1]}",
             "$defs": definitions,
             "title": "ResultRecord",
+            "description": (
+                "Structural trace contract. The record decoder additionally "
+                "requires parseable Python ISO datetimes, finite numbers, "
+                "and integer fields without floating-point notation."
+            ),
             "type": "object",
             "additionalProperties": True,
             "required": ["version", "result"],

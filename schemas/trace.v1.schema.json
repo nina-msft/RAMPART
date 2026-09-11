@@ -1,7 +1,6 @@
 {
   "$defs": {
     "EvalOutcome": {
-      "description": "What the evaluator determined.\n\nDETECTED: The condition was found.\nNOT_DETECTED: The condition was not found.\nUNDETERMINED: The evaluator could not make a determination.",
       "enum": [
         "detected",
         "not_detected",
@@ -12,7 +11,6 @@
     },
     "EvalResult": {
       "additionalProperties": true,
-      "description": "What an evaluator returns \u2014 a raw condition detection signal.\n\nThis is NOT a safety judgment. Whether DETECTED means \"safe\" or\n\"unsafe\" depends on context.\n\nArgs:\n    outcome: What the evaluator determined.\n    confidence: How confident the evaluator is (0.0 to 1.0).\n    evidence: Specific observations supporting the outcome.\n    rationale: Human-readable explanation.\n    undetermined_operands: Why parts of the evaluation stayed\n        undetermined, one distinct reason per entry. ``&`` and ``|``\n        record every operand they ran that came back UNDETERMINED,\n        taking the reasons that operand already carries or, for a\n        leaf, its rationale, or a fixed phrase when it gave none;\n        repeats are collapsed. ``~`` carries its inner result's\n        entries through. An evaluator that is not a composite\n        records nothing. It says nothing about ``outcome``: a\n        DETECTED or NOT_DETECTED result with entries here reached a\n        definitive answer while part of the evaluation did not, and\n        an UNDETERMINED result can carry entries recorded further\n        down the expression.",
       "properties": {
         "confidence": {
           "default": 1.0,
@@ -49,7 +47,6 @@
       "type": "object"
     },
     "HarmCategory": {
-      "description": "Classification of the safety concern being tested.\n\nUsed by the pytest @harm marker for categorization, by reporting\nsinks for grouping, and by safety gates for threshold configuration.\n\nHarmCategory is a StrEnum so that its values are native strings. This\nenables teams to use custom string categories alongside the built-in\nvalues: @pytest.mark.harm(\"custom_product_risk\") is valid, and the\nstring flows through Result.harm_category, reporting sinks, and\ndashboard grouping without requiring enum membership. Built-in values\nprovide IDE completion and typo protection for common categories;\nplain strings provide extensibility for team-specific risks.\n\nPhase availability:\n    Phase 1: All values are defined and usable with MockAdapter.\n    Phase 2: PROMPT_INJECTION, JAILBREAK, and remaining categories\n             gain execution strategy support via PyRIT integration.",
       "enum": [
         "memory_poisoning",
         "prompt_injection",
@@ -66,7 +63,6 @@
     },
     "InjectionRecord": {
       "additionalProperties": true,
-      "description": "Records what was injected and where, for reproduction and reporting.\n\nPopulated by XPIAExecution after handles are activated and stored\non Result. Provides the complete injection context needed to\nreproduce a test run: which payload was placed in which surface.\n\nArgs:\n    payload_id: The injected payload's identifier. None if\n        the surface implementation does not track payload IDs.\n    surface_name: The surface this payload was injected into\n        (e.g., \"SharePoint\", \"Exchange\").",
       "properties": {
         "payload_id": {
           "anyOf": [
@@ -92,7 +88,6 @@
       "type": "object"
     },
     "ObservabilityLevel": {
-      "description": "What the adapter can reliably observe during agent execution.\n\nDeclared by the adapter to inform evaluators and reporting. An\nevaluator that needs an evidence channel the adapter does not report\nreturns UNDETERMINED rather than a false NOT_DETECTED. That covers\ntool call data under RESPONSE_ONLY, and side effect data under\neither TOOL_ONLY or RESPONSE_ONLY.\n\nThe guarantee is per channel, not per field. A level that reports a\nchannel is taken at its word for what it puts in it, so a tool call\nreported with redacted or partial arguments still counts as observed\nand a predicate over those arguments can return NOT_DETECTED.\n\nThe ``observes_tool_calls`` and ``observes_side_effects`` properties\nlet evaluators ask what evidence is available without listing every\nenum member.",
       "enum": [
         "tool_and_side_effects",
         "tool_only",
@@ -103,7 +98,7 @@
     },
     "Payload": {
       "additionalProperties": true,
-      "description": "Content to inject into a surface or send alongside a prompt.\n\n``content`` is always the semantic text \u2014 the attack instruction,\nthe adversarial prompt, or a description of the payload's purpose.\nIt is what reports display and what makes a payload reproducible.\n\nFor text formats (TEXT, HTML, MARKDOWN), ``content`` is delivered\ndirectly \u2014 no artifact is needed. For binary formats (IMAGE, PDF,\nDOCX), ``artifact`` points to the file that surfaces and adapters\ndeliver. The ``content`` field still holds the human-readable text\nfor reporting and debugging.\n\nArgs:\n    content (str): The semantic text content. Always human-readable.\n    id (str): Stable identifier for reproduction and cache keys.\n    format (PayloadFormat): Delivery format. TEXT by default.\n    artifact (Path | None): Path to a rendered binary file.\n        Required for binary formats, must be None for text formats.\n    metadata (dict[str, Any]): Provenance tracking (persona,\n        template, variant index, generation params).",
+      "description": "Recorded text payload. Binary formats and file artifacts are not supported by this trace schema.",
       "properties": {
         "artifact": {
           "default": null,
@@ -141,7 +136,6 @@
     },
     "PopulationRef": {
       "additionalProperties": true,
-      "description": "Identifies the trial population that a Result belongs to.\n\nArgs:\n    id: Unique identifier shared by every result in the population.\n    index: Zero-based position of the result within the population.\n    size: Number of results requested for the population.\n    threshold: Required safe-result rate for the population.",
       "properties": {
         "id": {
           "title": "Id",
@@ -194,7 +188,6 @@
           ]
         }
       ],
-      "description": "What is sent to the agent in a single turn.\n\nCombines prompt text and inline payloads into a single object.\nAt least one of ``prompt`` or ``attachments`` must be provided.\n\nArgs:\n    prompt: The text prompt to send. None when only\n        attachments are sent (e.g., inline XPIA).\n    attachments: Payloads sent alongside the prompt for\n        inline delivery (e.g., poisoned documents).",
       "properties": {
         "attachments": {
           "items": {
@@ -221,7 +214,6 @@
     },
     "Response": {
       "additionalProperties": true,
-      "description": "What the agent returned for a single prompt.\n\nThe adapter populates every field it can observe.\n\nArgs:\n    text: The agent's text response.\n    tool_calls: Tool invocations observed during this interaction.\n    side_effects: Other observable effects.\n    metadata: Adapter-specific diagnostic data.",
       "properties": {
         "metadata": {
           "additionalProperties": true,
@@ -254,7 +246,6 @@
       "type": "object"
     },
     "SafetyStatus": {
-      "description": "Categorical safety status for structured reporting.\n\nSAFE: The agent behaved correctly.\nUNSAFE: A safety violation was detected.\nUNDETERMINED: The framework could not determine safety\n    (typically an observability gap).\nERROR: The test encountered an infrastructure error.",
       "enum": [
         "safe",
         "unsafe",
@@ -266,7 +257,6 @@
     },
     "SideEffect": {
       "additionalProperties": true,
-      "description": "An observable side effect beyond tool invocations.\n\nCovers effects like HTTP requests, file system changes, or\ndatabase writes that the adapter can observe but that are not\nmodeled as tool calls in the agent's API.\n\nArgs:\n    kind: Effect category (e.g., \"http_request\", \"file_write\").\n    details: Structured data about the effect.",
       "properties": {
         "details": {
           "additionalProperties": true,
@@ -286,7 +276,6 @@
     },
     "ToolCall": {
       "additionalProperties": true,
-      "description": "A tool invocation observed during agent execution.\n\nAdapters populate this from whatever observability they have \u2014 API\nresponse fields, telemetry streams, log parsing.\n\nArgs:\n    name: Tool name as the agent reported it (e.g., \"send_email\").\n    arguments: Parameters passed to the tool.\n    result: Tool return value, if the adapter can observe it.\n    timestamp: When the invocation occurred, if available.",
       "properties": {
         "arguments": {
           "additionalProperties": true,
@@ -312,7 +301,7 @@
         "timestamp": {
           "anyOf": [
             {
-              "description": "ISO 8601 datetime; UTC offset is optional.",
+              "description": "Python ISO 8601 datetime; UTC offset is optional. Parseability is enforced by the record decoder, not this schema.",
               "type": "string"
             },
             {
@@ -331,7 +320,6 @@
     },
     "Turn": {
       "additionalProperties": true,
-      "description": "One prompt-response exchange.\n\nTurn is immutable. The execution loop constructs a provisional Turn\n(without eval_result) for the evaluator call, then produces the\nfinal Turn via dataclasses.replace before appending to history.\n\nArgs:\n    request: What was sent to the agent.\n    response: What the agent returned.\n    eval_result: Evaluator outcome for this turn.\n    turn_number: Position in the conversation (0-indexed).\n    timestamp: When this exchange occurred.\n    driver_reasoning: Why the driver chose this request.",
       "properties": {
         "driver_reasoning": {
           "default": "",
@@ -358,7 +346,7 @@
         "timestamp": {
           "anyOf": [
             {
-              "description": "ISO 8601 datetime; UTC offset is optional.",
+              "description": "Python ISO 8601 datetime; UTC offset is optional. Parseability is enforced by the record decoder, not this schema.",
               "type": "string"
             },
             {
@@ -385,6 +373,7 @@
   "$id": "urn:rampart:trace:v1",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": true,
+  "description": "Structural trace contract. The record decoder additionally requires parseable Python ISO datetimes, finite numbers, and integer fields without floating-point notation.",
   "properties": {
     "pytest_nodeid": {
       "type": [
@@ -394,7 +383,6 @@
     },
     "result": {
       "additionalProperties": true,
-      "description": "The outcome of a safety test.\n\nThis is the single result type for the entire framework. Attacks\nand probes both produce Result objects. The reporting infrastructure,\npytest plugin, and dashboards all consume them.\n\nThe critical invariant: bool(result) returns result.safe. This\nmeans ``assert result, result.summary`` always means \"assert the\nagent behaved safely\" \u2014 and failures include the summary explaining\nwhat was detected.\n\n``safe`` is a derived property (``status is SafetyStatus.SAFE``),\nnot a stored field, so it can never drift out of sync with ``status``.\n\nArgs:\n    status: Categorical status for structured reporting.\n    summary: Human-readable one-line summary.\n    observability_level: What the adapter could observe. Required, so\n        that a report states a level someone chose rather than one the\n        framework assumed. Built-in strategies pass\n        ``adapter.observability_profile``.\n    turns: The full conversation for evidence and debugging.\n    duration_seconds: How long the test execution took.\n    harm_category: Which harm category this test covers.\n        Accepts HarmCategory enum values for built-in categories or plain strings\n        for team-defined categories (e.g., \"custom_product_risk\"). Both are strings\n        at runtime since HarmCategory is a StrEnum.\n    strategy: Name of the execution strategy (e.g., \"xpia\", \"crescendo\").\n    injections: What was injected and into which surfaces,\n        for full reproduction of multi-surface attacks. Empty for non-XPIA tests.\n    population: Trial population provenance. None for single executions.\n    metadata: Additional structured data for reporting.",
       "properties": {
         "duration_seconds": {
           "default": 0.0,
