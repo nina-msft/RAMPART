@@ -79,6 +79,9 @@ additional serializers.
 
 ## Transport compatibility boundary
 
+This section defines integration requirements. No canonical transport
+preparation API is implemented yet.
+
 The canonical codec preserves supported values; it does not provide a lenient
 transport mode. Existing transports and flat reports can accept data outside
 that domain, so adopting the codec is not a direct replacement of their current
@@ -118,6 +121,9 @@ does not make currently rejected formats readable by older readers.
   Readers supply a default for *shape* only; consumers must not infer a semantic
   negative from absence. A v1 record with no `manifest_snapshot` means "the
   manifest was not captured," not "there was no manifest."
+  This is interpretation guidance, not field-presence tracking: decoding uses
+  defaults and does not retain which fields were absent. For example, omitted
+  `turns` becomes `[]` and is emitted when re-encoded.
 - **Structural change = major bump.** Removing, renaming, or retyping a field,
   or changing its meaning or nesting, bumps `vN → vN+1` with a changelog and a
   migration note.
@@ -165,14 +171,17 @@ flowchart TD
 - `rampart.trace.v1` does not define a durable representation for binary or
   opaque payload artifacts. Encoding or decoding one fails closed rather than
   coercing it to text.
-- `ResultRecord` removes transport bookkeeping keys, including
-  `_rampart_source_worker`, from top-level `Result.metadata`; body serialization
-  does not. Nested user mappings are preserved.
+- `ResultRecord.to_dict()` removes transport bookkeeping keys, including
+  `_rampart_source_worker`, from top-level `Result.metadata` in the encoded
+  output. Body-only serialization and record decoding do not filter these keys.
+  Re-encoding a decoded record filters them from output without mutating the
+  result. Nested user mappings are preserved.
 
 ## Migration mechanics
 
-Only `rampart.trace.v1` exists today. If a later structural change introduces a
-new major:
+Only `rampart.trace.v1` exists today. No upcaster or persisted-data migration
+tooling is implemented. If a later structural change introduces a new major,
+the migration policy requires:
 
 - writers emit the latest supported major;
 - support for an older major uses an explicit adjacent upcaster
@@ -189,12 +198,15 @@ added without a major bump:
 `population_ref`, plus `artifacts` / `target` / `provenance`. A field that is
 truly *intrinsic to a result* instead lands as an additive-optional field on
 `Result`, inside the referenced `result` body. Either way each is
-additive-optional; none is populated at v1.
+additive-optional; none is emitted by the current implementation.
 
 Other future fields follow the same general rule: optional additions with a
 defined absence behavior do not require a major bump; structural changes do.
 
 ## Support window
+
+This is a release-support commitment; the current reader supports only
+`rampart.trace.v1`.
 
 Starting with the first release that writes durable trace records by default,
 RAMPART supports reading `vN` and `vN-1` for **two subsequent framework
