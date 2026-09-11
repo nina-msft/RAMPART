@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import (
@@ -18,6 +19,7 @@ from rampart.core.result import Result
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import Never
 
     from pydantic.json_schema import JsonSchemaValue
 
@@ -71,7 +73,7 @@ class ResultRecord:
             raise SchemaError(msg)
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize the envelope using the single Result body codec.
+        """Convert the envelope to a dict using the single Result body codec.
 
         Returns:
             dict[str, Any]: A versioned, JSON-safe record.
@@ -142,31 +144,58 @@ class ResultRecord:
         }
 
 
-def serialize_result(
-    *,
-    result: Result,
-    pytest_nodeid: str | None = None,
-    result_index: int | None = None,
-) -> dict[str, Any]:
-    """Serialize a result with its optional attribution.
+def serialize_record(*, record: ResultRecord) -> str:
+    """Serialize a canonical record to JSON text.
+
+    Args:
+        record (ResultRecord): The result and its optional attribution.
 
     Returns:
-        dict[str, Any]: The canonical versioned record.
+        str: JSON text containing the versioned record.
+
+    Raises:
+        SchemaError: If the record cannot be represented as canonical JSON.
     """
-    return ResultRecord(
-        result=result,
-        pytest_nodeid=pytest_nodeid,
-        result_index=result_index,
-    ).to_dict()
+    data = record.to_dict()
+    try:
+        return json.dumps(data, allow_nan=False)
+    except (ValueError, RecursionError) as exc:
+        msg = f"record: cannot serialize JSON ({exc})"
+        raise SchemaError(msg) from exc
 
 
-def deserialize_result(*, data: object) -> ResultRecord:
-    """Deserialize a canonical record.
+def deserialize_record(*, data: str) -> ResultRecord:
+    """Deserialize a canonical record from JSON text.
+
+    Args:
+        data (str): JSON text containing a versioned record.
 
     Returns:
         ResultRecord: The result and its attribution.
+
+    Raises:
+        SchemaError: If the input is not JSON text or the record is malformed.
+        UnsupportedSchemaVersionError: If the version is unsupported.
     """
-    return ResultRecord.from_dict(data)
+    if not isinstance(data, str):
+        msg = "record: expected a JSON string"
+        raise SchemaError(msg)
+    try:
+        decoded = json.loads(data, parse_constant=_reject_json_constant)
+    except (ValueError, RecursionError) as exc:
+        msg = f"record: invalid JSON ({exc})"
+        raise SchemaError(msg) from exc
+    return ResultRecord.from_dict(decoded)
+
+
+def _reject_json_constant(value: str) -> Never:
+    """Reject the non-finite constants accepted by Python's JSON parser.
+
+    Raises:
+        ValueError: Always, because these constants are not valid JSON numbers.
+    """
+    msg = f"non-finite number {value}"
+    raise ValueError(msg)
 
 
 def _decode_v1(data: Mapping[str, Any]) -> ResultRecord:

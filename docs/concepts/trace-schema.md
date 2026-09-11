@@ -3,8 +3,9 @@
 `rampart.core.serialization` defines RAMPART's canonical, versioned
 `Result`-record format. `ResultRecord.to_dict()` / `ResultRecord.from_dict()` own
 the versioned envelope and optional `pytest_nodeid` / `result_index` attribution.
-`serialize_result()` / `deserialize_result()` are convenience functions. Existing
-xdist and reporting consumers are not yet wired to this module.
+`serialize_record(record=...)` converts a `ResultRecord` to JSON text (`str`);
+`deserialize_record(data=...)` reconstructs a `ResultRecord` from JSON text.
+Existing xdist and reporting consumers are not yet wired to this module.
 
 This page defines how the schema may evolve as consumers adopt it.
 
@@ -15,6 +16,19 @@ cached Pydantic `TypeAdapter` over the existing standard dataclasses. Body dicts
 are fragments, not standalone durable records: persist a `ResultRecord` to
 include the version. `ResultRecord` references the live result; serialization
 does not mutate it.
+
+The dictionary methods remain available for projections and structured
+inspection. The serialization functions use those same methods at the JSON-text
+boundary, without a separate codec:
+
+```python
+record = ResultRecord(result=result, pytest_nodeid="tests/test_safety.py::test_case")
+text = serialize_record(record=record)
+restored = deserialize_record(data=text)
+```
+
+Malformed JSON and invalid record values raise `SchemaError`; unsupported
+versions raise its `UnsupportedSchemaVersionError` subclass.
 
 The adapter validates nested fields without string, boolean, or integer
 coercion. Dictionary input is checked for JSON-only values before strict
