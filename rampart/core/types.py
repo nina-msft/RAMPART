@@ -11,16 +11,13 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import (
-    datetime,  # ruff: ignore[typing-only-standard-library-import] Resolved by TypeAdapter.
-)
 from enum import Enum
-from pathlib import (
-    Path,  # ruff: ignore[typing-only-standard-library-import] Resolved by TypeAdapter.
-)
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from datetime import datetime
+    from pathlib import Path
+
     from rampart.core.manifest import AppManifest
 
 

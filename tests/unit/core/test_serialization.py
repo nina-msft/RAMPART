@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    TypeVar,
     get_type_hints,
 )
 from unittest.mock import patch
@@ -27,11 +28,13 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import TypeAdapter
 
+from rampart.core import types as core_types
 from rampart.core.result import (
     InjectionRecord,
     PopulationRef,
     Result,
     SafetyStatus,
+    _result_adapter,
 )
 from rampart.core.serialization import (
     TRACE_SCHEMA_VERSION,
@@ -58,6 +61,13 @@ if TYPE_CHECKING:
     from collections.abc import MutableMapping
 
 _TIMESTAMP = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+_AdapterType = TypeVar("_AdapterType")
+
+
+def _regular_adapter(cls: type[_AdapterType]) -> TypeAdapter[_AdapterType]:
+    adapter = TypeAdapter(cls)
+    adapter.rebuild(_types_namespace={"datetime": datetime, "Path": Path})
+    return adapter
 
 
 def _make_eval_result() -> EvalResult:
@@ -465,7 +475,7 @@ class TestBinaryPayloadFailsClosed:
         artifact.write_bytes(b"%PDF-1.4 fake")
         payload = Payload(content="doc", format=PayloadFormat.PDF, artifact=artifact)
 
-        assert TypeAdapter(Payload).validate_python(payload) is payload
+        assert _regular_adapter(Payload).validate_python(payload) is payload
         assert payload.artifact == artifact
 
 
@@ -597,7 +607,18 @@ class TestResultAdapter:
 
 
 class TestAdapterIsolation:
+    def test_cold_adapter_resolves_types_without_changing_their_module(self) -> None:
+        _result_adapter.cache_clear()
+
+        restored = ResultRecord.from_dict(_minimal_record_dict())
+        restored.to_dict()
+        ResultRecord.json_schema()
+
+        assert "datetime" not in vars(core_types)
+        assert "Path" not in vars(core_types)
+
     def test_public_annotations_remain_standard_types(self) -> None:
+        namespace = {"datetime": datetime, "Path": Path}
         for cls, name in [
             (Result, "metadata"),
             (Payload, "metadata"),
@@ -605,17 +626,21 @@ class TestAdapterIsolation:
             (ToolCall, "arguments"),
             (SideEffect, "details"),
         ]:
-            assert get_type_hints(cls, include_extras=True)[name] == dict[str, Any]
+            assert (
+                get_type_hints(cls, localns=namespace, include_extras=True)[name]
+                == (dict[str, Any])
+            )
         for cls in [ToolCall, Turn]:
-            assert get_type_hints(cls, include_extras=True)["timestamp"] == (
-                datetime | None
+            assert (
+                get_type_hints(cls, localns=namespace, include_extras=True)["timestamp"]
+                == datetime | None
             )
         assert not hasattr(Result, "__pydantic_config__")
 
     def test_regular_adapters_are_unchanged_before_and_after_canonical_use(
         self,
     ) -> None:
-        adapter = TypeAdapter(Result)
+        adapter = _regular_adapter(Result)
         original_schema = adapter.json_schema()
         result = _make_full_result(metadata={"tuple": (1, 2), "opaque": object()})
 
@@ -624,14 +649,14 @@ class TestAdapterIsolation:
         Result.json_schema()
 
         assert adapter.validate_python(result) is result
-        assert TypeAdapter(Result).validate_python(result) is result
+        assert _regular_adapter(Result).validate_python(result) is result
         assert adapter.json_schema() == original_schema
-        assert TypeAdapter(Result).json_schema() == original_schema
+        assert _regular_adapter(Result).json_schema() == original_schema
 
     def test_regular_adapter_can_still_generate_payload_ids(self) -> None:
         _make_full_result().to_dict()
 
-        payload = TypeAdapter(Payload).validate_python(
+        payload = _regular_adapter(Payload).validate_python(
             {"content": "live", "metadata": {"tuple": (1, 2)}}
         )
 
@@ -642,7 +667,7 @@ class TestAdapterIsolation:
         result = _make_full_result()
 
         canonical = result.to_dict()
-        regular = TypeAdapter(Result).dump_python(result, mode="json")
+        regular = _regular_adapter(Result).dump_python(result, mode="json")
 
         assert canonical["turns"][0]["timestamp"].endswith("+00:00")
         assert regular["turns"][0]["timestamp"].endswith("Z")
@@ -654,7 +679,7 @@ class TestAdapterIsolation:
         artifact.write_bytes(b"%PDF-1.4 fake")
         _make_full_result().to_dict()
 
-        payload = TypeAdapter(Payload).validate_python(
+        payload = _regular_adapter(Payload).validate_python(
             {"content": "doc", "format": "pdf", "artifact": str(artifact)}
         )
 

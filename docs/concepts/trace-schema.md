@@ -41,6 +41,8 @@ These policies belong to the cached canonical adapter, not to the public
 dataclass annotations or configuration. Fields remain `dict[str, Any]` and
 `datetime | None`. Independently constructed Pydantic adapters retain their
 normal behavior, including live binary payload support.
+The canonical adapter supplies its own `datetime` / `Path` resolution namespace;
+the shared types module keeps those imports under `TYPE_CHECKING`.
 
 `ResultRecord.json_schema()` returns the adapter-derived body schema plus the
 versioned envelope. Small schema customizations describe the trace-only payload

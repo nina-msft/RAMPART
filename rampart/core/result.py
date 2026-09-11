@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum, StrEnum
 from functools import cache
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -278,7 +280,10 @@ def _result_adapter() -> TypeAdapter[Result]:
     Returns:
         TypeAdapter[Result]: The cached adapter.
     """
-    return TypeAdapter(Annotated[Result, GetPydanticSchema(trace_schema)])
+    adapter = TypeAdapter[Result](Annotated[Result, GetPydanticSchema(trace_schema)])
+    # Nested dataclasses keep these imports under TYPE_CHECKING.
+    adapter.rebuild(_types_namespace={"datetime": datetime, "Path": Path})
+    return adapter
 
 
 class _ResultJsonSchema(GenerateJsonSchema):
